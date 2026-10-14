@@ -1,0 +1,71 @@
+# Dev utilities
+/dev-utils/
+
+# Model artifacts (multi-GB; exported from safetensors on demand)
+harness/models/
+
+# Runtime logs
+daemon-err.log
+
+# Build output
+/web/node_modules/
+/web/dist/
+/harness/build/
+/harness/build*/
+/harness/.zig-cache/
+/harness/*.exe
+/harness/*.pdb
+/harness/*.jsonl
+/harness/*.log
+/harness/nyaxus_harness_linux
+/harness/nyaxus_daemon_linux
+
+# Runtime data and logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Backups
+*.bak
+*.bak-*
+
+# Python
+__pycache__/
+*.pyc
+
+# Local benchmark runs
+/benchmarks/
+
+# Legacy code and old deployment configs, kept locally
+/legacy/
+/legacy-deployment-stuff/
+/patches/
+
+# Web dev runtime
+web/dev.log
+web/vite.log
+web/vite-err.log
+web/vite.pid
+nyaxus-daemon.log
+nyaxus-daemon-err.log
+
+# secrets and local-only configuration
+.env
+.agents/
+/prompt-packs/
+pack-snapshot.json
+
+# dev-cache: live-debug dumps (session snapshots, firecrawl caches) -
+# moved here so one folder covers the throwaway artifacts instead of a
+# pattern scattershot; the folder is never published.
+/dev-cache/
+# root-level run logs of throwaway debugging sessions
+/*.log
+# compiled vendored objects padded beside the sources during builds
+/harness/*.o
+/asan_build.log
+
+/.editor/
+
+# public-export staging and review trees

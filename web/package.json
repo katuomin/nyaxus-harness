@@ -1,0 +1,38 @@
+{
+  "name": "nyaxus-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "test:client": "node scripts/build_edit_flow_test.mjs && node scripts/build_markdown_test.mjs && node scripts/build_routing_test.mjs && node scripts/build_graph_test.mjs && node scripts/build_vision_test.mjs && node scripts/build_reasoning_blocks_test.mjs && node scripts/build_actions_center_test.mjs && node scripts/build_tasks_test.mjs && node scripts/build_spawn_test.mjs && node scripts/build_skills_test.mjs && node scripts/build_steer_composer_test.mjs && node scripts/build_prompt_snippets_test.mjs && node scripts/build_search_palette_test.mjs && node scripts/build_inspector_test.mjs && node scripts/build_group_state_test.mjs"
+  },
+  "dependencies": {
+    "katex": "^0.18.7",
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.4.26",
+    "globals": "^16.5.0",
+    "puppeteer-core": "^25.12.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.68.0",
+    "vite": "^7.2.4"
+  }
+}

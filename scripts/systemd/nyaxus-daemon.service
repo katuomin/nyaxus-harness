@@ -1,0 +1,37 @@
+[Unit]
+Description=Nyaxus agent harness daemon
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+# Install root: adjust the /agent paths below for your deployment layout.
+WorkingDirectory=/agent
+ExecStart=/agent/harness/nyaxus_daemon_linux
+Restart=always
+RestartSec=3
+# 2026-10-03 lesson: the default start limit (5 starts / 10 s) turns an
+# environmental failure (port held, missing state files) into a restart
+# storm that trips the counter and then gives up. A bounded but patient
+# limit keeps auto-recovery while making a genuinely broken start visible
+# in the journal instead of a give-up.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+Environment=NYAXUS_PORT=8787
+# The tracked .env carries this deployment's service secrets; the daemon
+# reads NYAXUS_* configuration from its own config layer first.
+EnvironmentFile=-/agent/.env
+
+# Hardened defaults; the daemon needs no privileges beyond its own dir.
+# NoNewPrivileges is deliberately NOT set: it is sticky, so the terminal
+# tool's shells inherit it and sudo can no longer setuid to root ("the
+# 'no new privileges' flag is set, which prevents sudo from running as
+# root"). ProtectSystem/PrivateTmp keep the daemon sandboxed without
+# blocking setuid children.
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

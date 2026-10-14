@@ -1,0 +1,13 @@
+# Docker build context exclusions for /agent.
+# Keeps `docker build` from shipping 78GB of model weights to the daemon.
+# Neither Dockerfile.agent nor Dockerfile.hindsight COPYs any of these.
+/models/
+/logs/
+/frontend/
+/.git/
+/deprecated/
+/camofox-browser/
+/mem0/
+/.editor/
+*.html
+*.css

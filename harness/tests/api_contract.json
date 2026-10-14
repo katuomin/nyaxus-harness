@@ -1,0 +1,451 @@
+{
+  "prefix": "/api",
+  "note": "Single route inventory (docs/api-parity.md). Re-derive with --record after daemon route changes; review the diff.",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/v1/approvals",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fs",
+      "expect": 400
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/health",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/infra",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/bank",
+      "expect": 503
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/consolidations",
+      "expect": 503
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/journey",
+      "expect": 400
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/records",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/status",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/memory/units/{id}",
+      "expect": 400
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/models",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/profiles",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/prompt-packs",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/prompt-packs/snapshots/{id}",
+      "expect": 404
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/prompt-packs/{id}",
+      "expect": 404
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/prompt-packs/{id}/snapshots",
+      "expect": 404
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/prompt-snippets",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/providers",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/routes",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/search",
+      "expect": 400
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}",
+      "expect": 404
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/search",
+      "expect": 404
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/status",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{sid}/attachments/{aid}",
+      "expect": 400
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/settings",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/skills",
+      "expect": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sources",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/approvals/always/remove",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/login",
+      "expect": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/consolidate",
+      "expect": 409
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/consolidations/{id}/approve",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/consolidations/{id}/reject",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/journey",
+      "expect": 409
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/migrate",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/recall",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/records",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/records/{id}/approve",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/records/{id}/reject",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/records/{id}/supersede",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/core",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/delete",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/invalidate",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/reactivate",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/supersede",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/memory/units/{id}/uncore",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/profiles",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/profiles/{id}",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/profiles/{id}/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/profiles/{id}/rename",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/preview",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/{id}",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/{id}/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/{id}/files",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/{id}/files/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-packs/{id}/validate",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-snippets",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt-snippets/delete",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/provider/check",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/providers",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/providers/{name}/check",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/providers/{name}/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/runs/{id}/commands",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions",
+      "expect": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/context",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/context/compact",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/context/decision",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/context/recompress",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/md-log",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/messages/{mid}",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/profile",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/rename",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/retitle",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/rewind",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/runs",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/select",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/tags",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{sid}/messages/{mid}/delete",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/settings",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills/delete",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills/enable",
+      "expect": 404
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills/restore",
+      "expect": 400
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills/trash",
+      "expect": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/skills/trash/delete",
+      "expect": 400
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/settings",
+      "expect": 400
+    },
+    {
+      "method": "SSE",
+      "path": "/api/v1/sessions/{id}/events",
+      "expect": 200
+    }
+  ]
+}

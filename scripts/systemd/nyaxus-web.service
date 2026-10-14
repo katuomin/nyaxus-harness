@@ -1,0 +1,24 @@
+[Unit]
+Description=Nyaxus web client (vite preview over web/dist)
+After=network-online.target nyaxus-daemon.service
+Wants=nyaxus-daemon.service
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+# Install root: adjust the /agent paths below for your deployment layout.
+WorkingDirectory=/agent/web
+# The API target is baked at build time (VITE_HARNESS_MODE=http builds the
+# client against the same-origin /api proxy -> dist only needs the daemon
+# address); vite preview serves the built bundle, not the dev server.
+ExecStart=/usr/bin/npx vite preview --host 0.0.0.0 --port 4173
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
