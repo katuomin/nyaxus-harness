@@ -200,8 +200,9 @@ void MemoryDb::migrate(std::string& error) {
         if (sqlite3_step(stmt) == SQLITE_ROW) version = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
     }
-    if (version >= 5) return;
-    if (version != 0 && version != 1 && version != 2 && version != 3 && version != 4) {
+    if (version >= 7) return;
+    if (version != 0 && version != 1 && version != 2 && version != 3 &&
+        version != 4 && version != 5 && version != 6) {
         error = "unknown schema version " + std::to_string(version);
         return;
     }
@@ -236,6 +237,7 @@ void MemoryDb::migrate(std::string& error) {
         "  supersedes_version_id INTEGER NOT NULL DEFAULT 0,"
         "  model_id TEXT NOT NULL DEFAULT '',"
         "  prompt_revision TEXT NOT NULL DEFAULT '',"
+        "  generation_id TEXT NOT NULL DEFAULT '',"
         "  store_reason TEXT NOT NULL,"
         "  created_at TEXT NOT NULL"
         ");"
@@ -330,6 +332,39 @@ void MemoryDb::migrate(std::string& error) {
         "  watermark INTEGER NOT NULL DEFAULT 0,"
         "  created_at TEXT NOT NULL,"
         "  updated_at TEXT NOT NULL"
+        ");"
+        "CREATE TABLE memory_generations ("
+        "  id INTEGER PRIMARY KEY,"
+        "  generation_id TEXT NOT NULL,"
+        "  kind TEXT NOT NULL,"
+        "  status TEXT NOT NULL,"
+        "  model_id TEXT NOT NULL DEFAULT '',"
+        "  prompt_id TEXT NOT NULL DEFAULT '',"
+        "  prompt_sha256 TEXT NOT NULL DEFAULT '',"
+        "  input_refs TEXT NOT NULL DEFAULT '',"
+        "  output_refs TEXT NOT NULL DEFAULT '',"
+        "  session_id TEXT NOT NULL DEFAULT '',"
+        "  latency_ms INTEGER NOT NULL DEFAULT 0,"
+        "  error TEXT NOT NULL DEFAULT '',"
+        "  created_at TEXT NOT NULL"
+        ");"
+        "CREATE INDEX idx_generations_kind ON memory_generations (kind, created_at);"
+        "CREATE INDEX idx_generations_session ON memory_generations (session_id, created_at);"
+        "CREATE TABLE memory_scenes ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  name TEXT NOT NULL UNIQUE,"
+        "  summary TEXT NOT NULL DEFAULT '',"
+        "  heat INTEGER NOT NULL DEFAULT 0,"
+        "  content TEXT NOT NULL,"
+        "  created_at TEXT NOT NULL,"
+        "  updated_at TEXT NOT NULL,"
+        "  generation_id TEXT NOT NULL DEFAULT ''"
+        ");"
+        "CREATE TABLE memory_persona ("
+        "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "  content TEXT NOT NULL,"
+        "  generated_at TEXT NOT NULL,"
+        "  generation_id TEXT NOT NULL DEFAULT ''"
         ");";
     if (version == 0) {
         exec(schema, error);
@@ -417,6 +452,86 @@ void MemoryDb::migrate(std::string& error) {
         }
     }
     exec("PRAGMA user_version = 5;", error);
+    if (!error.empty()) return;
+    // v5 -> v6: the generation provenance log. One row per memory generation
+    // (extract | direct | approved | import | journey): what input went in,
+    // what came out, which prompt and model produced it, how long it took,
+    // and whether it failed. memory_versions.generation_id back-references
+    // the log row for each unit it produced.
+    exec("CREATE TABLE IF NOT EXISTS memory_generations ("
+         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+         "  generation_id TEXT NOT NULL UNIQUE,"
+         "  kind TEXT NOT NULL,"
+         "  status TEXT NOT NULL,"
+         "  model_id TEXT NOT NULL DEFAULT '',"
+         "  prompt_id TEXT NOT NULL DEFAULT '',"
+         "  prompt_sha256 TEXT NOT NULL DEFAULT '',"
+         "  input_refs TEXT NOT NULL DEFAULT '[]',"
+         "  output_refs TEXT NOT NULL DEFAULT '[]',"
+         "  session_id TEXT NOT NULL DEFAULT '',"
+         "  latency_ms INTEGER NOT NULL DEFAULT 0,"
+         "  error TEXT NOT NULL DEFAULT '',"
+         "  created_at TEXT NOT NULL"
+         ");", error);
+    if (!error.empty()) return;
+    exec("CREATE INDEX IF NOT EXISTS idx_memory_generations_kind_created "
+         "ON memory_generations (kind, created_at);", error);
+    if (!error.empty()) return;
+    exec("CREATE INDEX IF NOT EXISTS idx_memory_generations_session_created "
+         "ON memory_generations (session_id, created_at);", error);
+    if (!error.empty()) return;
+    // Probe first: a stamped bank without the versions table (a minimal
+    // legacy artifact) needs no ALTER, and the probe keeps a re-run on an
+    // already-migrated bank a no-op (mirrors the v2 -> v3 core probe).
+    if (version != 0) {
+        bool table_exists = false;
+        bool has_generation_id = false;
+        sqlite3_stmt* stmt = prepare_stmt(
+            db_, "PRAGMA table_info(memory_versions);", error, "prepare");
+        if (stmt) {
+            while (step_row(stmt, "generation_id migration probe") == 1) {
+                table_exists = true;
+                const unsigned char* name = sqlite3_column_text(stmt, 1);
+                if (name &&
+                    std::string(reinterpret_cast<const char*>(name)) ==
+                        "generation_id") {
+                    has_generation_id = true;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+        if (table_exists && !has_generation_id) {
+            exec("ALTER TABLE memory_versions "
+                 "ADD COLUMN generation_id TEXT NOT NULL DEFAULT '';",
+                 error);
+            if (!error.empty()) return;
+        }
+    }
+    exec("PRAGMA user_version = 6;", error);
+    if (!error.empty()) return;
+    // v6 -> v7: the L2 scene blocks (topic-level narrative distillation of
+    // the L1 units) and the L3 persona (the single core document injected
+    // into every prompt). Both are derived artifacts, rewritten in place by
+    // the auxiliary model - the units are the source of truth.
+    exec("CREATE TABLE IF NOT EXISTS memory_scenes ("
+         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+         "  name TEXT NOT NULL UNIQUE,"
+         "  summary TEXT NOT NULL DEFAULT '',"
+         "  heat INTEGER NOT NULL DEFAULT 0,"
+         "  content TEXT NOT NULL,"
+         "  created_at TEXT NOT NULL,"
+         "  updated_at TEXT NOT NULL,"
+         "  generation_id TEXT NOT NULL DEFAULT ''"
+         ");", error);
+    if (!error.empty()) return;
+    exec("CREATE TABLE IF NOT EXISTS memory_persona ("
+         "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+         "  content TEXT NOT NULL,"
+         "  generated_at TEXT NOT NULL,"
+         "  generation_id TEXT NOT NULL DEFAULT ''"
+         ");", error);
+    if (!error.empty()) return;
+    exec("PRAGMA user_version = 7;", error);
 }
 
 // ── Retain ───────────────────────────────────────────────────────────────
@@ -473,7 +588,8 @@ long long MemoryDb::insert_unit(const UnitSpec& spec, std::string& error) {
     stmt = prepare_stmt(
         db_,
         "INSERT INTO memory_versions (memory_id, text, content_hash, model_id,"
-        " prompt_revision, store_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+        " prompt_revision, generation_id, store_reason, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
     error, "prepare");
     if (!stmt) {
         rollback();
@@ -485,8 +601,9 @@ long long MemoryDb::insert_unit(const UnitSpec& spec, std::string& error) {
     bind_text(stmt, 3, content_hash);
     bind_text(stmt, 4, spec.model_id);
     bind_text(stmt, 5, spec.prompt_revision);
-    bind_text(stmt, 6, spec.store_reason);
-    bind_text(stmt, 7, now);
+    bind_text(stmt, 6, spec.generation_id);
+    bind_text(stmt, 7, spec.store_reason);
+    bind_text(stmt, 8, now);
     step_row(stmt, "version insert");  // throws on error; DONE = success
     const long long version_id = sqlite3_last_insert_rowid(db_);
     sqlite3_finalize(stmt);
@@ -713,7 +830,8 @@ std::optional<MemoryDb::VersionRow> MemoryDb::version(long long version_id,
     sqlite3_stmt* stmt = prepare_stmt(
         db_,
         "SELECT id, memory_id, text, content_hash, supersedes_version_id, model_id,"
-        " prompt_revision, store_reason, created_at FROM memory_versions WHERE id = ?;",
+        " prompt_revision, generation_id, store_reason, created_at"
+        " FROM memory_versions WHERE id = ?;",
     error, "prepare");
     if (!stmt) {
         error = "prepare version fetch failed";
@@ -730,8 +848,9 @@ std::optional<MemoryDb::VersionRow> MemoryDb::version(long long version_id,
         r.supersedes_version_id = sqlite3_column_int64(stmt, 4);
         r.model_id = column_text(stmt, 5);
         r.prompt_revision = column_text(stmt, 6);
-        r.store_reason = column_text(stmt, 7);
-        r.created_at = column_text(stmt, 8);
+        r.generation_id = column_text(stmt, 7);
+        r.store_reason = column_text(stmt, 8);
+        r.created_at = column_text(stmt, 9);
         row = std::move(r);
     }
     sqlite3_finalize(stmt);
@@ -744,7 +863,8 @@ std::vector<MemoryDb::VersionRow> MemoryDb::versions_by_ids(
     if (ids.empty()) return {};
     std::string sql =
         "SELECT id, memory_id, text, content_hash, supersedes_version_id, model_id,"
-        " prompt_revision, store_reason, created_at FROM memory_versions WHERE id IN (";
+        " prompt_revision, generation_id, store_reason, created_at"
+        " FROM memory_versions WHERE id IN (";
     for (std::size_t i = 0; i < ids.size(); ++i) sql += (i == 0 ? "?" : ",?");
     sql += ");";
     sqlite3_stmt* stmt = prepare_stmt(db_, sql.c_str(), error, "prepare");
@@ -765,8 +885,9 @@ std::vector<MemoryDb::VersionRow> MemoryDb::versions_by_ids(
         r.supersedes_version_id = sqlite3_column_int64(stmt, 4);
         r.model_id = column_text(stmt, 5);
         r.prompt_revision = column_text(stmt, 6);
-        r.store_reason = column_text(stmt, 7);
-        r.created_at = column_text(stmt, 8);
+        r.generation_id = column_text(stmt, 7);
+        r.store_reason = column_text(stmt, 8);
+        r.created_at = column_text(stmt, 9);
         rows.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -779,8 +900,8 @@ std::vector<MemoryDb::VersionRow> MemoryDb::versions_for_unit(long long unit_id,
     sqlite3_stmt* stmt = prepare_stmt(
         db_,
         "SELECT id, memory_id, text, content_hash, supersedes_version_id, model_id,"
-        " prompt_revision, store_reason, created_at FROM memory_versions"
-        " WHERE memory_id = ? ORDER BY id;",
+        " prompt_revision, generation_id, store_reason, created_at"
+        " FROM memory_versions WHERE memory_id = ? ORDER BY id;",
         error, "prepare");
     if (!stmt) {
         error = "prepare version history fetch failed";
@@ -797,8 +918,9 @@ std::vector<MemoryDb::VersionRow> MemoryDb::versions_for_unit(long long unit_id,
         r.supersedes_version_id = sqlite3_column_int64(stmt, 4);
         r.model_id = column_text(stmt, 5);
         r.prompt_revision = column_text(stmt, 6);
-        r.store_reason = column_text(stmt, 7);
-        r.created_at = column_text(stmt, 8);
+        r.generation_id = column_text(stmt, 7);
+        r.store_reason = column_text(stmt, 8);
+        r.created_at = column_text(stmt, 9);
         rows.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -1638,6 +1760,53 @@ std::vector<MemoryDb::UnitRow> MemoryDb::active_units_updated_since(
     return rows;
 }
 
+std::vector<MemoryDb::UnitRow> MemoryDb::active_units_created_since(
+    const std::string& since, int cap, std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string sql =
+        "SELECT id, type, state, state_reason, scope, session_id, profile, run_id,"
+        " current_version_id, confidence, mentioned_at, occurred_start, occurred_end,"
+        " last_consolidated_at, core, created_at, updated_at FROM memory_units"
+        " WHERE state = 'active'";
+    if (!since.empty()) sql += " AND created_at > ?";
+    sql += " ORDER BY created_at DESC";
+    if (cap > 0) sql += " LIMIT " + std::to_string(cap);
+    sql += ";";
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql.c_str(), error, "prepare");
+    if (!stmt) {
+        error = "prepare scene selection failed";
+        return {};
+    }
+    int idx = 1;
+    if (!since.empty()) {
+        bind_text(stmt, idx++, since);
+    }
+    std::vector<UnitRow> rows;
+    while (step_row(stmt, "scene selection") == 1) {
+        UnitRow row;
+        row.id = sqlite3_column_int64(stmt, 0);
+        row.type = column_text(stmt, 1);
+        row.state = column_text(stmt, 2);
+        row.state_reason = column_text(stmt, 3);
+        row.scope = column_text(stmt, 4);
+        row.session_id = column_text(stmt, 5);
+        row.profile = column_text(stmt, 6);
+        row.run_id = column_text(stmt, 7);
+        row.current_version_id = sqlite3_column_int64(stmt, 8);
+        row.confidence = sqlite3_column_double(stmt, 9);
+        row.mentioned_at = column_text(stmt, 10);
+        row.occurred_start = column_text(stmt, 11);
+        row.occurred_end = column_text(stmt, 12);
+        row.last_consolidated_at = column_text(stmt, 13);
+        row.core = sqlite3_column_int(stmt, 14) != 0;
+        row.created_at = column_text(stmt, 15);
+        row.updated_at = column_text(stmt, 16);
+        rows.push_back(std::move(row));
+    }
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
 void MemoryDb::mark_consolidated(long long unit_id, std::string& error) {
     std::lock_guard<std::mutex> lock(mutex_);
     sqlite3_stmt* stmt = prepare_stmt(
@@ -2000,7 +2169,254 @@ long long MemoryDb::journey_count(std::string& error) const {
     return count;
 }
 
-// ── Status ───────────────────────────────────────────────────────────────────────
+// ── L2 scene blocks + L3 persona ────────────────────────────────────────────
+
+std::vector<MemoryDb::SceneRow> MemoryDb::scenes(std::string& error) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_,
+        "SELECT id, name, summary, heat, content, created_at, updated_at,"
+        " generation_id FROM memory_scenes ORDER BY heat DESC, name ASC;",
+        error, "prepare scene list");
+    if (!stmt) return {};
+    std::vector<SceneRow> out;
+    while (step_row(stmt, "scene list") == 1) {
+        SceneRow row;
+        row.id = sqlite3_column_int64(stmt, 0);
+        row.name = column_text(stmt, 1);
+        row.summary = column_text(stmt, 2);
+        row.heat = sqlite3_column_int(stmt, 3);
+        row.content = column_text(stmt, 4);
+        row.created_at = column_text(stmt, 5);
+        row.updated_at = column_text(stmt, 6);
+        row.generation_id = column_text(stmt, 7);
+        out.push_back(std::move(row));
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+long long MemoryDb::upsert_scene(const std::string& name, const std::string& summary,
+                                 int heat, const std::string& content,
+                                 const std::string& generation_id,
+                                 std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (name.empty() || content.empty()) {
+        error = "scene name and content are required";
+        return 0;
+    }
+    const std::string now = now_utc();
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_,
+        "INSERT INTO memory_scenes (name, summary, heat, content, created_at,"
+        " updated_at, generation_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(name) DO UPDATE SET"
+        " summary = excluded.summary, heat = excluded.heat,"
+        " content = excluded.content, updated_at = excluded.updated_at,"
+        " generation_id = excluded.generation_id;",
+        error, "prepare scene upsert");
+    if (!stmt) return 0;
+    bind_text(stmt, 1, name);
+    bind_text(stmt, 2, summary);
+    sqlite3_bind_int(stmt, 3, heat);
+    bind_text(stmt, 4, content);
+    bind_text(stmt, 5, now);
+    bind_text(stmt, 6, now);
+    bind_text(stmt, 7, generation_id);
+    const int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        error = sqlite3_errmsg(db_);
+        return 0;
+    }
+    sqlite3_stmt* get = prepare_stmt(
+        db_, "SELECT id FROM memory_scenes WHERE name = ?;",
+        error, "prepare scene id");
+    long long id = 0;
+    if (get) {
+        bind_text(get, 1, name);
+        if (sqlite3_step(get) == SQLITE_ROW) id = sqlite3_column_int64(get, 0);
+        sqlite3_finalize(get);
+    }
+    return id;
+}
+
+bool MemoryDb::delete_scene_by_name(const std::string& name, std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_, "DELETE FROM memory_scenes WHERE name = ?;",
+        error, "prepare scene delete");
+    if (!stmt) return false;
+    bind_text(stmt, 1, name);
+    const int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
+std::string MemoryDb::max_scene_updated_at(std::string& error) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_, "SELECT MAX(updated_at) FROM memory_scenes;",
+        error, "prepare scene watermark");
+    if (!stmt) return "";
+    std::string out;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* text = sqlite3_column_text(stmt, 0);
+        if (text) out = reinterpret_cast<const char*>(text);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+long long MemoryDb::scene_count(std::string& error) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_, "SELECT COUNT(*) FROM memory_scenes;", error, "prepare scene count");
+    if (!stmt) return 0;
+    long long count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+std::optional<MemoryDb::PersonaRow> MemoryDb::persona(std::string& error) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_, "SELECT id, content, generated_at, generation_id FROM memory_persona"
+        " WHERE id = 1;",
+        error, "prepare persona fetch");
+    if (!stmt) return std::nullopt;
+    std::optional<PersonaRow> row;
+    if (step_row(stmt, "persona fetch") == 1) {
+        PersonaRow p;
+        p.id = sqlite3_column_int64(stmt, 0);
+        p.content = column_text(stmt, 1);
+        p.generated_at = column_text(stmt, 2);
+        p.generation_id = column_text(stmt, 3);
+        row = std::move(p);
+    }
+    sqlite3_finalize(stmt);
+    return row;
+}
+
+long long MemoryDb::upsert_persona(const std::string& content,
+                                   const std::string& generation_id,
+                                   std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (content.empty()) {
+        error = "persona content is required";
+        return 0;
+    }
+    const std::string now = now_utc();
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_,
+        "INSERT INTO memory_persona (id, content, generated_at, generation_id)"
+        " VALUES (1, ?, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET"
+        " content = excluded.content, generated_at = excluded.generated_at,"
+        " generation_id = excluded.generation_id;",
+        error, "prepare persona upsert");
+    if (!stmt) return 0;
+    bind_text(stmt, 1, content);
+    bind_text(stmt, 2, now);
+    bind_text(stmt, 3, generation_id);
+    const int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        error = sqlite3_errmsg(db_);
+        return 0;
+    }
+    return 1;
+}
+
+// ── Generation provenance log ─────────────────────────────────────────────────
+
+long long MemoryDb::insert_generation(const GenerationLog& generation, std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (generation.generation_id.empty()) {
+        error = "generation_id is required";
+        return 0;
+    }
+    const std::string created_at =
+        generation.created_at.empty() ? now_utc() : generation.created_at;
+    sqlite3_stmt* stmt = prepare_stmt(
+        db_,
+        "INSERT OR IGNORE INTO memory_generations (generation_id, kind, status,"
+        " model_id, prompt_id, prompt_sha256, input_refs, output_refs, session_id,"
+        " latency_ms, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        error, "prepare");
+    if (!stmt) return 0;
+    bind_text(stmt, 1, generation.generation_id);
+    bind_text(stmt, 2, generation.kind);
+    bind_text(stmt, 3, generation.status.empty() ? "succeeded" : generation.status);
+    bind_text(stmt, 4, generation.model_id);
+    bind_text(stmt, 5, generation.prompt_id);
+    bind_text(stmt, 6, generation.prompt_sha256);
+    bind_text(stmt, 7, generation.input_refs.empty() ? "[]" : generation.input_refs);
+    bind_text(stmt, 8, generation.output_refs.empty() ? "[]" : generation.output_refs);
+    bind_text(stmt, 9, generation.session_id);
+    sqlite3_bind_int64(stmt, 10, generation.latency_ms);
+    bind_text(stmt, 11, generation.error);
+    bind_text(stmt, 12, created_at);
+    try {
+        step_row(stmt, "generation insert");  // throws on error; DONE = success
+    } catch (const std::exception& e) {
+        sqlite3_finalize(stmt);
+        error = e.what();
+        return 0;
+    }
+    const long long rowid = sqlite3_last_insert_rowid(db_);
+    sqlite3_finalize(stmt);
+    return rowid;
+}
+
+std::vector<MemoryDb::GenerationLog> MemoryDb::generations(
+    const std::string& kind, const std::string& status, int limit, std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (limit <= 0) limit = 50;
+    if (limit > 500) limit = 500;
+    std::string sql =
+        "SELECT id, generation_id, kind, status, model_id, prompt_id, prompt_sha256,"
+        " input_refs, output_refs, session_id, latency_ms, error, created_at"
+        " FROM memory_generations";
+    std::vector<std::string> filters;
+    if (!kind.empty()) filters.push_back("kind = ?");
+    if (!status.empty()) filters.push_back("status = ?");
+    if (!filters.empty()) {
+        sql += " WHERE ";
+        for (std::size_t i = 0; i < filters.size(); ++i) {
+            sql += (i == 0 ? "" : " AND ") + filters[i];
+        }
+    }
+    sql += " ORDER BY id DESC LIMIT " + std::to_string(limit) + ";";
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql.c_str(), error, "prepare");
+    if (!stmt) return {};
+    int idx = 1;
+    if (!kind.empty()) bind_text(stmt, idx++, kind);
+    if (!status.empty()) bind_text(stmt, idx++, status);
+    std::vector<GenerationLog> rows;
+    while (step_row(stmt, "generation fetch") == 1) {
+        GenerationLog g;
+        g.id = sqlite3_column_int64(stmt, 0);
+        g.generation_id = column_text(stmt, 1);
+        g.kind = column_text(stmt, 2);
+        g.status = column_text(stmt, 3);
+        g.model_id = column_text(stmt, 4);
+        g.prompt_id = column_text(stmt, 5);
+        g.prompt_sha256 = column_text(stmt, 6);
+        g.input_refs = column_text(stmt, 7);
+        g.output_refs = column_text(stmt, 8);
+        g.session_id = column_text(stmt, 9);
+        g.latency_ms = sqlite3_column_int64(stmt, 10);
+        g.error = column_text(stmt, 11);
+        g.created_at = column_text(stmt, 12);
+        rows.push_back(std::move(g));
+    }
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
+// ── Status ─────────────────────────────────────────────────────────────────────────
 
 namespace {
 long long scalar_count(sqlite3* db, const char* sql, std::string& error) {

@@ -231,22 +231,31 @@ int socket_read(SocketHandle handle, char* buffer, std::size_t size) {
 
 SseWriter::SseWriter(SocketHandle handle) : handle_(handle) {}
 
+std::mutex& SseWriter::write_lock() {
+    static std::mutex lock;
+    return lock;
+}
+
 bool SseWriter::write(const std::string& data, std::uint64_t id) {
     std::string frame;
     if (id != 0) frame += "id: " + std::to_string(id) + "\n";
     frame += "data: " + data + "\n\n";
+    std::lock_guard<std::mutex> guard(write_lock());
     return socket_write_all(handle_, frame);
 }
 
 bool SseWriter::retry(std::uint32_t milliseconds) const {
+    std::lock_guard<std::mutex> guard(write_lock());
     return socket_write_all(handle_, "retry: " + std::to_string(milliseconds) + "\n\n");
 }
 
 bool SseWriter::named(const std::string& event, const std::string& data) {
+    std::lock_guard<std::mutex> guard(write_lock());
     return socket_write_all(handle_, "event: " + event + "\ndata: " + data + "\n\n");
 }
 
 bool SseWriter::close() const {
+    std::lock_guard<std::mutex> guard(write_lock());
     return socket_write_all(handle_, "data: [DONE]\n\n");
 }
 

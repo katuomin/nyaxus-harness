@@ -1,4 +1,5 @@
 #include "nyaxus/memory_custom.hpp"
+#include "nyaxus/log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -209,11 +210,6 @@ std::string iso_utc(std::chrono::system_clock::time_point when) {
     return out.str();
 }
 
-bool valid_type(const std::string& type) {
-    return type == "world" || type == "experience" || type == "observation" ||
-           type == "mental_model" || type == "procedure" || type == "lesson";
-}
-
 // Optional per-stage timing: set NYAXUS_MEM_TIMING=1 to log stage durations
 // to stderr. Off by default; the recall path is latency-sensitive.
 struct StageTimer {
@@ -278,6 +274,11 @@ std::vector<std::string> dates_in(const std::string& text) {
 }
 
 }  // namespace
+
+bool valid_type(const std::string& type) {
+    return type == "world" || type == "experience" || type == "observation" ||
+           type == "mental_model" || type == "procedure" || type == "lesson";
+}
 
 // ── Anchor extraction ────────────────────────────────────────────────────
 
@@ -468,11 +469,262 @@ bool parse_candidates(const std::string& raw, std::vector<Candidate>& out, std::
     return true;
 }
 
+// ── LLM semantic dedup (extract path) ─────────────────────────────────────
+// Top-K similar existing units per candidate (fast, no LLM), then one batched
+// LLM judgment (store/skip/update/merge). Adapted to the local 6-type
+// vocabulary and the consolidation approval gate. store-all fallback on any
+// failure.
+constexpr int kDedupTopK = 5;
+constexpr double kDedupFloor = kConflictBandLower;  // 0.55: "same topic" floor
+
+struct DedupOutcome {
+    std::string action;  // "store" | "skip" | "replace"
+    std::string text;    // text to store (candidate text, or merged text)
+    std::string type;    // type to store
+    std::vector<long long> retire;  // units to propose retiring (replace only)
+    double sim = 0.0;  // max cosine to a related unit (the proposal's similarity)
+};
+
+struct DedupPoolEntry {
+    long long id = 0;
+    std::string text;
+    std::string type;
+};
+
+struct DedupNewEntry {
+    std::string id;  // stable id within this batch (c0, c1, ...)
+    std::string text;
+    std::string type;
+    std::vector<long long> related;  // existing unit ids (the pool)
+    double max_sim = 0.0;
+};
+
+// Top-K active units whose current version embedding is at least `floor`
+// cosine to the query vector, best first. Returns (unit_id, cosine).
+std::vector<std::pair<long long, double>> similar_units(
+    MemoryDb& db, const std::vector<float>& query, int top_k, double floor,
+    std::string& error) {
+    std::vector<std::pair<long long, double>> out;
+    if (query.empty()) return out;
+    std::vector<MemoryDb::UnitRow> units = db.units_by_state("active", "", error);
+    if (!error.empty() || units.empty()) return out;
+    std::vector<long long> version_ids;
+    for (const MemoryDb::UnitRow& unit : units) {
+        if (unit.current_version_id > 0) version_ids.push_back(unit.current_version_id);
+    }
+    std::vector<MemoryDb::VersionRow> versions = db.versions_by_ids(version_ids, error);
+    if (!error.empty()) return out;
+    std::unordered_map<long long, long long> version_to_unit;
+    for (const MemoryDb::VersionRow& version : versions) {
+        version_to_unit[version.id] = version.memory_id;
+    }
+    std::vector<MemoryDb::EmbedRow> embeddings = db.active_embeddings(error);
+    if (!error.empty()) return out;
+    for (const MemoryDb::EmbedRow& row : embeddings) {
+        const auto it = version_to_unit.find(row.version_id);
+        if (it == version_to_unit.end()) continue;
+        const double score = cosine(query, row.vector);
+        if (score >= floor) out.push_back({it->second, score});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (static_cast<int>(out.size()) > top_k) out.resize(top_k);
+    return out;
+}
+
+std::string build_dedup_user_prompt(const std::vector<DedupPoolEntry>& pool,
+                                    const std::vector<DedupNewEntry>& new_entries) {
+    json::Array pool_arr;
+    for (const DedupPoolEntry& entry : pool) {
+        json::Object o;
+        o["id"] = json::Value(entry.id);
+        o["content"] = json::Value(entry.text);
+        o["type"] = json::Value(entry.type);
+        pool_arr.push_back(json::Value(std::move(o)));
+    }
+    json::Array cand_arr;
+    for (const DedupNewEntry& entry : new_entries) {
+        json::Object o;
+        o["id"] = json::Value(entry.id);
+        o["content"] = json::Value(entry.text);
+        o["type"] = json::Value(entry.type);
+        json::Array rel;
+        for (const long long id : entry.related) rel.push_back(json::Value(id));
+        o["related"] = json::Value(std::move(rel));
+        cand_arr.push_back(json::Value(std::move(o)));
+    }
+    std::ostringstream user;
+    user << "## Existing memory pool (" << pool.size() << " records)\n";
+    user << json::stringify(json::Value(std::move(pool_arr))) << "\n\n";
+    user << "## New candidates (" << new_entries.size() << ")\n";
+    user << json::stringify(json::Value(std::move(cand_arr))) << "\n\n";
+    user << "Judge each candidate and output the decision JSON array.";
+    return user.str();
+}
+
+// Parse the LLM's decision array into one outcome per candidate (in order).
+// A missing/invalid decision, an invalid action, or a non-JSON response falls
+// back to "store" (the candidate's own text) - the store-all safety net.
+std::vector<DedupOutcome> parse_dedup_decisions(
+    const std::string& raw, const std::vector<DedupNewEntry>& new_entries,
+    const std::unordered_set<long long>& pool_ids) {
+    std::vector<DedupOutcome> outcomes;
+    outcomes.reserve(new_entries.size());
+    std::unordered_map<std::string, std::size_t> index_by_id;
+    for (std::size_t i = 0; i < new_entries.size(); ++i) {
+        index_by_id[new_entries[i].id] = i;
+        DedupOutcome outcome;
+        outcome.action = "store";
+        outcome.text = new_entries[i].text;
+        outcome.type = new_entries[i].type;
+        outcomes.push_back(std::move(outcome));
+    }
+    const std::string text = strip_code_fences(raw);
+    json::Value parsed;
+    try {
+        parsed = json::parse(text);
+    } catch (...) {
+        return outcomes;  // store-all
+    }
+    const json::Value* decisions = nullptr;
+    if (parsed.type() == json::Value::Type::Array) {
+        decisions = &parsed;
+    } else if (parsed.has("decisions")) {
+        decisions = &parsed.at("decisions");
+    }
+    if (!decisions) return outcomes;
+    for (const json::Value& item : decisions->as_array()) {
+        if (item.type() != json::Value::Type::Object) continue;
+        const std::string id = item.at("id").as_string("");
+        const auto it = index_by_id.find(id);
+        if (it == index_by_id.end()) continue;  // hallucinated id
+        DedupOutcome& outcome = outcomes[it->second];
+        const std::string action = item.at("action").as_string("store");
+        if (action == "skip") {
+            outcome.action = "skip";
+            continue;
+        }
+        if (action == "update" || action == "merge") {
+            const std::string merged = item.at("merged_content").as_string("");
+            if (merged.empty()) continue;  // no merged text -> keep store
+            const std::string merged_type = item.at("merged_type").as_string("");
+            std::vector<long long> targets;
+            if (item.has("target_ids")) {
+                for (const json::Value& t : item.at("target_ids").as_array()) {
+                    const long long tid = t.as_integer(0);
+                    if (tid > 0 && pool_ids.count(tid) > 0 &&
+                        std::find(targets.begin(), targets.end(), tid) == targets.end()) {
+                        targets.push_back(tid);
+                    }
+                }
+            }
+            outcome.action = "replace";
+            outcome.text = merged;
+            outcome.type = valid_type(merged_type)
+                               ? merged_type
+                               : new_entries[it->second].type;
+            outcome.retire = std::move(targets);
+        }
+        // "store" (or unknown) -> keep the default store outcome.
+    }
+    return outcomes;
+}
+
+std::vector<DedupOutcome> dedup_extract(
+    MemoryDb& db, const std::vector<Candidate>& candidates,
+    const std::vector<std::vector<float>>& embeddings,
+    const std::function<std::string(const std::string&)>& dedup) {
+    // Default: store all.
+    std::vector<DedupOutcome> outcomes;
+    outcomes.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) {
+        DedupOutcome outcome;
+        outcome.action = "store";
+        outcome.text = candidate.text;
+        outcome.type = candidate.type;
+        outcomes.push_back(std::move(outcome));
+    }
+    if (!dedup) return outcomes;
+
+    // Phase 1: candidate recall per candidate (fast, no LLM).
+    std::vector<DedupNewEntry> new_entries;
+    new_entries.reserve(candidates.size());
+    bool any_related = false;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        DedupNewEntry entry;
+        entry.id = "c" + std::to_string(i);
+        entry.text = candidates[i].text;
+        entry.type = candidates[i].type;
+        if (i < embeddings.size() && !embeddings[i].empty()) {
+            std::string error;
+            const std::vector<std::pair<long long, double>> similar =
+                similar_units(db, embeddings[i], kDedupTopK, kDedupFloor, error);
+            for (const auto& pair : similar) {
+                entry.related.push_back(pair.first);
+                if (pair.second > entry.max_sim) entry.max_sim = pair.second;
+            }
+        }
+        if (!entry.related.empty()) any_related = true;
+        new_entries.push_back(std::move(entry));
+    }
+    if (!any_related) return outcomes;  // store-all: nothing similar to judge
+
+    // Unified pool (de-duplicated across candidates), with text + type.
+    std::unordered_set<long long> pool_ids;
+    std::vector<DedupPoolEntry> pool;
+    std::vector<long long> pool_unit_ids;
+    for (const DedupNewEntry& entry : new_entries) {
+        for (const long long id : entry.related) {
+            if (pool_ids.count(id) > 0) continue;
+            pool_ids.insert(id);
+            pool.push_back({id, "", ""});
+            pool_unit_ids.push_back(id);
+        }
+    }
+    std::string error;
+    std::vector<MemoryDb::UnitRow> units = db.units_by_ids(pool_unit_ids, error);
+    if (!error.empty()) return outcomes;  // store-all
+    std::unordered_map<long long, MemoryDb::UnitRow> unit_by_id;
+    std::vector<long long> version_ids;
+    for (const MemoryDb::UnitRow& unit : units) {
+        unit_by_id[unit.id] = unit;
+        if (unit.current_version_id > 0) version_ids.push_back(unit.current_version_id);
+    }
+    std::vector<MemoryDb::VersionRow> versions = db.versions_by_ids(version_ids, error);
+    if (!error.empty()) return outcomes;  // store-all
+    std::unordered_map<long long, std::string> version_text;
+    for (const MemoryDb::VersionRow& version : versions) {
+        version_text[version.id] = version.text;
+    }
+    for (DedupPoolEntry& entry : pool) {
+        const auto unit_it = unit_by_id.find(entry.id);
+        if (unit_it == unit_by_id.end()) continue;
+        entry.type = unit_it->second.type;
+        entry.text = version_text[unit_it->second.current_version_id];
+    }
+
+    // Phase 2: one batched LLM judgment. Any failure -> store-all.
+    const std::string prompt = build_dedup_user_prompt(pool, new_entries);
+    std::string raw;
+    try {
+        raw = dedup(prompt);
+    } catch (const std::exception&) {
+        return outcomes;  // store-all
+    }
+    if (raw.empty()) return outcomes;
+    outcomes = parse_dedup_decisions(raw, new_entries, pool_ids);
+    for (std::size_t i = 0; i < outcomes.size() && i < new_entries.size(); ++i) {
+        outcomes[i].sim = new_entries[i].max_sim;
+    }
+    return outcomes;
+}
+
 }  // namespace
 
 RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainSpec& spec,
                     const std::function<std::string(const std::string&)>& extract,
-                    std::string& error) {
+                    std::string& error,
+                    const std::function<std::string(const std::string&)>& dedup) {
     RetainResult result;
     std::vector<Candidate> candidates;
     if (!spec.direct_text.empty()) {
@@ -501,18 +753,25 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
         spec.session_id.empty() ? "global" : "session:" + spec.session_id;
 
     // Dedupe policy: exact content-hash duplicates are rejected here; NEAR
-    // duplicates are intentionally accepted and left to the consolidation
-    // sweep (blueprint: sweeps own near-duplicate collapse, with cooldown and
-    // fixpoint). Rejecting near-duplicates at retain time would both lose
-    // updates ("don't silently rewrite history") and make the sweep's
-    // collapse unreachable, since anything close enough to collapse would
-    // have been dropped on write.
+    // duplicates are left to the consolidation sweep. On the extract path an
+    // LLM dedup judge additionally decides store/skip/update/merge per
+    // candidate (see dedup_extract); skip discards the candidate and
+    // update/merge store the merged text plus a gated proposal to retire the
+    // superseded units. A dedup failure falls back to store-all.
     const std::string default_reason =
         "retained from turn " + (spec.run_id.empty() ? spec.document_id : spec.run_id) +
         " (model " + (spec.model_id.empty() ? "direct" : spec.model_id) +
         (spec.prompt_revision.empty() ? std::string("") : ", prompt " + spec.prompt_revision) +
         "); grounded in the submitted source; source event in the Nyaxus ledger";
 
+    // Pass 1: cheap deterministic gates (length/type/grounding/exact-hash) +
+    // embedding. Surviving candidates carry their embedding for dedup recall.
+    struct Prepared {
+        const Candidate* candidate = nullptr;
+        std::vector<float> embedding;
+        std::string embedding_model;
+    };
+    std::vector<Prepared> prepared;
     for (const Candidate& candidate : candidates) {
         if (candidate.text.empty() || candidate.text.size() > 4096) {
             ++result.invalid;
@@ -532,15 +791,64 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
             ++result.duplicate;
             continue;
         }
+        Prepared p;
+        p.candidate = &candidate;
+        if (embed_model.ok) {
+            p.embedding = embed_truncated(embed_model, candidate.text);
+            p.embedding_model = "qwen3-embedding-0.6b";
+        }
+        prepared.push_back(std::move(p));
+    }
+
+    // LLM semantic dedup (extract path only). store-all fallback on any
+    // failure: a dedup problem never loses a candidate.
+    std::vector<DedupOutcome> outcomes;
+    if (spec.direct_text.empty() && !prepared.empty()) {
+        std::vector<Candidate> prepared_candidates;
+        std::vector<std::vector<float>> prepared_embeddings;
+        prepared_candidates.reserve(prepared.size());
+        prepared_embeddings.reserve(prepared.size());
+        for (const Prepared& p : prepared) {
+            prepared_candidates.push_back(*p.candidate);
+            prepared_embeddings.push_back(p.embedding);
+        }
+        outcomes = dedup_extract(db, prepared_candidates, prepared_embeddings, dedup);
+    } else {
+        for (const Prepared& p : prepared) {
+            DedupOutcome outcome;
+            outcome.action = "store";
+            outcome.text = p.candidate->text;
+            outcome.type = p.candidate->type;
+            outcomes.push_back(std::move(outcome));
+        }
+    }
+
+    // Pass 2: apply the outcomes. store -> insert the candidate; skip ->
+    // drop; replace -> insert the merged text + propose retiring the targets
+    // (the consolidation approval gate).
+    for (std::size_t i = 0; i < prepared.size(); ++i) {
+        const Prepared& p = prepared[i];
+        const DedupOutcome& outcome = outcomes[i];
+        if (outcome.action == "skip") {
+            ++result.skipped;
+            continue;
+        }
+        const std::string& text = outcome.text;
+        const std::string& type = outcome.type;
+        if (text.empty() || text.size() > 4096 || !valid_type(type)) {
+            ++result.invalid;
+            continue;
+        }
+        // Embed the stored text (a merged text differs from the candidate).
         std::vector<float> embedding;
         std::string embedding_model;
         if (embed_model.ok) {
-            embedding = embed_truncated(embed_model, candidate.text);
+            embedding = embed_truncated(embed_model, text);
             embedding_model = "qwen3-embedding-0.6b";
         }
         MemoryDb::UnitSpec unit_spec;
-        unit_spec.type = candidate.type;
-        unit_spec.text = candidate.text;
+        unit_spec.type = type;
+        unit_spec.text = text;
         unit_spec.scope = scope;
         unit_spec.session_id = spec.session_id;
         unit_spec.profile = spec.profile;
@@ -548,17 +856,18 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
         unit_spec.store_reason = spec.store_reason.empty() ? default_reason : spec.store_reason;
         unit_spec.model_id = spec.model_id;
         unit_spec.prompt_revision = spec.prompt_revision;
-        unit_spec.confidence = candidate.confidence;
+        unit_spec.generation_id = spec.generation_id;
+        unit_spec.confidence = p.candidate->confidence;
         if (!spec.run_id.empty()) {
             unit_spec.sources.push_back({spec.run_id, ""});
         }
-        const std::vector<Anchor> anchors = extract_anchors(candidate.text);
+        const std::vector<Anchor> anchors = extract_anchors(text);
         for (const Anchor& anchor : anchors) {
             unit_spec.anchors.push_back({anchor.kind, anchor.value});
             unit_spec.entities.push_back(anchor.value);
         }
         unit_spec.embedding = std::move(embedding);
-        unit_spec.embedding_model = embedding_model;
+        unit_spec.embedding_model = std::move(embedding_model);
         const long long unit_id = db.insert_unit(unit_spec, error);
         if (!error.empty()) return result;
         if (unit_id <= 0) {
@@ -567,6 +876,24 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
         }
         ++result.stored;
         result.unit_ids.push_back(unit_id);
+        // Gated: propose retiring each superseded unit (approval queue). A
+        // pair the operator already decided (or that is pending) is skipped;
+        // both units get the 24h cooldown so they do not churn.
+        for (const long long target : outcome.retire) {
+            std::string cerr;
+            if (db.has_consolidation_for_pair(target, unit_id, cerr)) {
+                if (!cerr.empty()) return result;
+                continue;
+            }
+            if (db.add_consolidation(target, unit_id, outcome.sim, scope, cerr,
+                                     "dedup") == 0 &&
+                !cerr.empty()) {
+                return result;
+            }
+            db.mark_consolidated(target, cerr);
+            db.mark_consolidated(unit_id, cerr);
+            if (!cerr.empty()) return result;
+        }
     }
     return result;
 }
@@ -575,7 +902,8 @@ bool process_retain_payload(MemoryDb& db, const qwen3::Model& embed_model,
                             const std::string& payload_json,
                             const std::function<std::string(const std::string&)>& extract,
                             std::string& operation_id, std::string& error,
-                            bool& permanent) {
+                            bool& permanent,
+                            const std::function<std::string(const std::string&)>& dedup) {
     permanent = false;
     operation_id.clear();
     error.clear();
@@ -604,6 +932,10 @@ bool process_retain_payload(MemoryDb& db, const qwen3::Model& embed_model,
     spec.direct_type = payload.at("direct_type").as_string("");
     spec.model_id = payload.at("model_id").as_string("");
     spec.store_reason = payload.at("store_reason").as_string("");
+    spec.generation_id = payload.at("generation_id").as_string("");
+    spec.prompt_id = payload.at("prompt_id").as_string("");
+    spec.prompt_sha256 = payload.at("prompt_sha256").as_string("");
+    spec.prompt_revision = payload.at("prompt_revision").as_string("");
     if (spec.model_id.empty()) {
         spec.model_id = spec.direct_text.empty() ? "aux" : "direct";
     }
@@ -613,6 +945,43 @@ bool process_retain_payload(MemoryDb& db, const qwen3::Model& embed_model,
         return false;
     }
 
+    const auto generation_started = std::chrono::steady_clock::now();
+    // Provenance: one best-effort log row per generation. A failure to
+    // write the row is logged, never propagated (the generation itself has
+    // already happened).
+    const std::string gen_kind =
+        spec.document_id.rfind("nyaxus-record:", 0) == 0 ? "approved" : "extract";
+    auto emit_generation_log =
+        [&](const std::string& status, const std::string& message,
+            const std::vector<long long>& unit_ids) {
+            if (spec.generation_id.empty()) return;
+            MemoryDb::GenerationLog gen;
+            gen.generation_id = spec.generation_id;
+            gen.kind = gen_kind;
+            gen.status = status;
+            gen.model_id = spec.model_id;
+            gen.prompt_id = spec.prompt_id;
+            gen.prompt_sha256 = spec.prompt_sha256;
+            json::Array inputs;
+            for (const std::string& ref : {spec.document_id, spec.session_id,
+                                           spec.run_id}) {
+                if (!ref.empty()) inputs.push_back(json::Value(ref));
+            }
+            gen.input_refs = json::stringify(json::Value(std::move(inputs)));
+            json::Array outputs;
+            for (const long long id : unit_ids) outputs.push_back(json::Value(id));
+            gen.output_refs = json::stringify(json::Value(std::move(outputs)));
+            gen.session_id = spec.session_id;
+            gen.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - generation_started)
+                                  .count();
+            gen.error = message;
+            std::string log_error;
+            if (db.insert_generation(gen, log_error) <= 0) {
+                log::warn("memory generations: log insert failed: " + log_error);
+            }
+        };
+
     // Extraction (aux model) runs before retain: a provider failure is a
     // retryable job failure, while an empty candidate list is a legitimate
     // terminal outcome ("nothing worth remembering").
@@ -620,21 +989,25 @@ bool process_retain_payload(MemoryDb& db, const qwen3::Model& embed_model,
     if (spec.direct_text.empty()) {
         if (!extract) {
             error = "no extractor available and no direct text";
+            emit_generation_log("failed", error, {});
             return false;
         }
         try {
             raw = extract(spec.content);
         } catch (const std::exception& e) {
             error = std::string("aux extraction call failed: ") + e.what();
+            emit_generation_log("failed", error, {});
             return false;
         }
         if (raw.empty()) {
             error = "aux extraction returned no text";
+            emit_generation_log("failed", error, {});
             return false;
         }
         try {
             const json::Value parsed = json::parse(strip_code_fences(raw));
             if (parsed.has("candidates") && parsed.at("candidates").as_array().empty()) {
+                emit_generation_log("succeeded", {}, {});
                 operation_id = "no candidates extracted";
                 return true;
             }
@@ -647,10 +1020,15 @@ bool process_retain_payload(MemoryDb& db, const qwen3::Model& embed_model,
     // to parse. (The callback form keeps the provider-neutral contract; a
     // direct path never invokes it.)
     auto resolved = [raw](const std::string&) { return raw; };
-    RetainResult result = retain(db, embed_model, spec, resolved, error);
-    if (!error.empty()) return false;
+    RetainResult result = retain(db, embed_model, spec, resolved, error, dedup);
+    if (!error.empty()) {
+        emit_generation_log("failed", error, result.unit_ids);
+        return false;
+    }
+    emit_generation_log("succeeded", {}, result.unit_ids);
     operation_id = "stored=" + std::to_string(result.stored) +
                    " duplicate=" + std::to_string(result.duplicate) +
+                   " skipped=" + std::to_string(result.skipped) +
                    " ungrounded=" + std::to_string(result.ungrounded) +
                    " invalid=" + std::to_string(result.invalid);
     return true;
@@ -673,6 +1051,18 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
     RecallResult result;
     std::string error;
     StageTimer total("recall (total)");
+
+    // Wall-clock budget (0 = no deadline): checked at stage boundaries so an
+    // expired recall returns partial results (RRF order, no rerank) instead
+    // of blocking the caller past the operator's timeout.
+    const std::chrono::steady_clock::time_point deadline =
+        req.deadline_ms > 0
+            ? std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(req.deadline_ms)
+            : std::chrono::steady_clock::time_point::max();
+    const auto deadline_exceeded = [&]() {
+        return std::chrono::steady_clock::now() >= deadline;
+    };
 
     // Load active units with their current versions.
     StageTimer stage_load("load units+versions");
@@ -741,6 +1131,14 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
         const auto unit_it = gated.find(unit_id);
         return unit_it == gated.end() ? 0 : unit_it->second.current_version_id;
     };
+
+    if (deadline_exceeded()) {
+        result.ok = true;
+        result.timed_out = true;
+        result.error = "recall deadline expired before the signal stages; "
+                       "no results";
+        return result;
+    }
 
     // Anchors are extracted once and shared by Stage 1 (exact) and Stage 4a
     // (entity/model).
@@ -896,13 +1294,21 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
         rrf_rank[pool[i]] = static_cast<long long>(i + 1);
 
     // Stage 7: cross-encoder rerank of the top of the pool (RRF-only
-    // fallback when the reranker is unavailable).
+    // fallback when the reranker is unavailable). The rerank is the
+    // expensive stage (one cross-encoder pass over the top of the pool),
+    // so the deadline check lands here: on expiry the pool keeps its RRF
+    // order and the result is flagged partial.
     StageTimer stage_rerank("rerank");
     bool reranked = false;
     std::map<long long, float> rerank_scores;
     const std::size_t rerank_count =
         std::min(pool.size(), static_cast<std::size_t>(req.rerank_top));
-    if (rerank_model.ok && !req.skip_rerank) {
+    if (deadline_exceeded()) {
+        result.timed_out = true;
+        result.error = "recall deadline expired before rerank; partial "
+                       "results in RRF order";
+    }
+    if (rerank_model.ok && !req.skip_rerank && !result.timed_out) {
         bool all_ok = true;
         std::vector<std::string> texts;
         texts.reserve(rerank_count);
@@ -986,6 +1392,22 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
         return a.observation && !b.observation;
     });
 
+    // Per-item cap: exact token truncation (keep the first cap tokens,
+    // mark the cut so the model sees the bound, re-count the marked text so
+    // tokens_used stays honest). Without the truncation the cap was
+    // accounting-only and the injected total could exceed the budget by up
+    // to (actual - cap) tokens per item.
+    auto bounded_text = [&](const std::string& text, int& tokens) -> std::string {
+        tokens = count_tokens(embed_model, text);
+        if (tokens <= req.per_item_cap_tokens) return text;
+        std::vector<int> ids = qwen3::encode(embed_model, text);
+        ids.resize(static_cast<std::size_t>(req.per_item_cap_tokens));
+        std::string bounded = qwen3::decode(embed_model, ids) + " [truncated]";
+        tokens = count_tokens(embed_model, bounded);
+        result.truncated++;
+        return bounded;
+    };
+
     int remaining = req.budget_tokens;
     for (const Final& final : finals) {
         if (remaining <= 0) break;
@@ -999,16 +1421,19 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
         }
         const std::string* text = version_text(final.unit_id);
         if (!text) continue;
-        int tokens = count_tokens(embed_model, *text);
-        if (tokens > req.per_item_cap_tokens) tokens = req.per_item_cap_tokens;
-        if (tokens > remaining) continue;
+        int tokens = 0;
+        std::string injected = bounded_text(*text, tokens);
+        if (tokens > remaining) {
+            result.budget_dropped++;
+            continue;
+        }
         remaining -= tokens;
         result.tokens_used += tokens;
 
         RecallHit hit;
         hit.unit_id = final.unit_id;
         hit.version_id = version_of(final.unit_id);
-        hit.text = *text;
+        hit.text = std::move(injected);
         hit.tokens = tokens;
         const auto unit_it = gated.find(final.unit_id);
         hit.type = unit_it->second.type;
@@ -1086,16 +1511,19 @@ RecallResult recall(MemoryDb& db, const qwen3::Model& embed_model,
                 if (unit_it == gated.end()) continue;
                 const std::string* text = version_text(link.target_id);
                 if (!text) continue;
-                int tokens = count_tokens(embed_model, *text);
-                if (tokens > req.per_item_cap_tokens) tokens = req.per_item_cap_tokens;
-                if (link_tokens + tokens > link_budget) continue;
+                int tokens = 0;
+                std::string injected = bounded_text(*text, tokens);
+                if (link_tokens + tokens > link_budget) {
+                    result.budget_dropped++;
+                    continue;
+                }
                 link_tokens += tokens;
                 result.tokens_used += tokens;
 
                 RecallHit extra;
                 extra.unit_id = link.target_id;
                 extra.version_id = version_of(link.target_id);
-                extra.text = *text;
+                extra.text = std::move(injected);
                 extra.tokens = tokens;
                 const auto version_it = version_by_id.find(extra.version_id);
                 extra.store_reason =
@@ -1433,6 +1861,325 @@ bool decide_consolidation(MemoryDb& db, long long candidate_id, bool approve,
         if (!error.empty()) return false;
     }
     return db.set_consolidation_status(candidate_id, approve ? "approved" : "rejected", error);
+}
+
+// ── L2 scene refresh + L3 persona (derived distillation) ────────────────
+// Layered distillation (L1 units -> L2 scenes -> L3 persona) on the
+// relational core: the aux model integrates the bank's new units into the
+// scene set and rewrites the persona from the scenes. Both are derived
+// artifacts - a failed call leaves the existing state unchanged (the L1
+// units are the source of truth), so these paths never lose a memory.
+constexpr int kSceneMinNewUnits = 5;   // below this there is no new material
+constexpr int kSceneMaxScenes = 20;    // hard cap on the scene set
+constexpr int kSceneMaxNewUnits = 100;  // prompt cap on the new units
+constexpr int kSceneContentMax = 4000;  // per-scene content cap (chars)
+constexpr int kPersonaMaxChars = 4000;  // hard validation cap (prompt asks <= 2000)
+constexpr int kPersonaSceneBudget = 12000;  // scene content chars in the prompt
+
+bool valid_scene_slug(const std::string& name) {
+    if (name.empty() || name.size() > 64) return false;
+    for (const char c : name) {
+        if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string build_scenes_user_prompt(
+    const std::vector<MemoryDb::SceneRow>& scenes,
+    const std::vector<MemoryDb::UnitRow>& units,
+    const std::unordered_map<long long, std::string>& texts) {
+    json::Array scene_arr;
+    for (const MemoryDb::SceneRow& scene : scenes) {
+        json::Object o;
+        o["id"] = json::Value(scene.id);
+        o["name"] = json::Value(scene.name);
+        o["summary"] = json::Value(scene.summary);
+        o["heat"] = json::Value(static_cast<long long>(scene.heat));
+        o["content"] = json::Value(scene.content);
+        scene_arr.push_back(json::Value(std::move(o)));
+    }
+    json::Array unit_arr;
+    for (const MemoryDb::UnitRow& unit : units) {
+        const auto it = texts.find(unit.id);
+        if (it == texts.end() || it->second.empty()) continue;
+        json::Object o;
+        o["id"] = json::Value(unit.id);
+        o["type"] = json::Value(unit.type);
+        o["text"] = json::Value(it->second);
+        o["created_at"] = json::Value(unit.created_at);
+        unit_arr.push_back(json::Value(std::move(o)));
+    }
+    std::string prompt = "## Existing scenes (" + std::to_string(scenes.size()) + ")\n" +
+                         json::stringify(json::Value(std::move(scene_arr))) + "\n\n" +
+                         "## New memories (" + std::to_string(units.size()) + ")\n" +
+                         json::stringify(json::Value(std::move(unit_arr)));
+    return prompt;
+}
+
+std::vector<SceneDecision> parse_scene_decisions(const std::string& raw) {
+    std::vector<SceneDecision> out;
+    const std::string text = strip_code_fences(raw);
+    if (text.empty()) return out;
+    json::Value parsed;
+    try {
+        parsed = json::parse(text);
+    } catch (const std::exception&) {
+        return out;  // not JSON: no change (the scenes are derived)
+    }
+    // Accept a bare array or a {"scenes": [...]} envelope.
+    json::Value arr;
+    if (parsed.type() == json::Value::Type::Array) {
+        arr = parsed;
+    } else if (parsed.type() == json::Value::Type::Object && parsed.has("scenes")) {
+        arr = parsed.at("scenes");
+    } else {
+        return out;
+    }
+    if (arr.type() != json::Value::Type::Array) return out;
+    for (const json::Value& item : arr.as_array()) {
+        if (item.type() != json::Value::Type::Object) continue;
+        SceneDecision d;
+        d.action = item.at("action").as_string("");
+        d.name = item.at("name").as_string("");
+        d.summary = item.at("summary").as_string("");
+        d.content = item.at("content").as_string("");
+        d.heat = static_cast<int>(item.at("heat").as_number(1));
+        if (item.has("retire") && item.at("retire").type() == json::Value::Type::Array) {
+            for (const json::Value& r : item.at("retire").as_array()) {
+                const std::string slug = r.as_string("");
+                if (!slug.empty()) d.retire.push_back(slug);
+            }
+        }
+        if (d.action != "create" && d.action != "update" && d.action != "merge") {
+            continue;  // unknown action: drop the decision, not the refresh
+        }
+        if (!valid_scene_slug(d.name) || d.content.empty() ||
+            d.content.size() > static_cast<std::size_t>(kSceneContentMax)) {
+            continue;
+        }
+        if (d.summary.size() > 200) d.summary.resize(200);
+        if (d.heat < 1) d.heat = 1;
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+SceneRefreshResult refresh_scenes(
+    MemoryDb& db,
+    const std::function<std::string(const std::string&)>& scenes_llm,
+    const std::string& generation_id, std::string& error) {
+    SceneRefreshResult result;
+    const std::string watermark = db.max_scene_updated_at(error);
+    if (!error.empty()) return result;
+    const std::vector<MemoryDb::UnitRow> new_units =
+        db.active_units_created_since(watermark, kSceneMaxNewUnits, error);
+    if (!error.empty()) return result;
+    result.new_units = static_cast<int>(new_units.size());
+    if (result.new_units < kSceneMinNewUnits) return result;  // not ran
+
+    std::vector<long long> version_ids;
+    version_ids.reserve(new_units.size());
+    for (const MemoryDb::UnitRow& unit : new_units) {
+        if (unit.current_version_id > 0) version_ids.push_back(unit.current_version_id);
+    }
+    std::vector<MemoryDb::VersionRow> versions = db.versions_by_ids(version_ids, error);
+    if (!error.empty()) return result;
+    std::unordered_map<long long, std::string> texts;
+    for (const MemoryDb::VersionRow& version : versions) {
+        texts[version.id] = version.text;
+    }
+    for (auto it = texts.begin(); it != texts.end();) {
+        if (it->second.empty()) it = texts.erase(it); else ++it;
+    }
+    if (texts.empty()) return result;  // nothing readable to distill
+    for (const MemoryDb::UnitRow& unit : new_units) {
+        if (texts.count(unit.id) > 0) result.unit_ids.push_back(unit.id);
+    }
+
+    const std::vector<MemoryDb::SceneRow> scenes = db.scenes(error);
+    if (!error.empty()) return result;
+
+    const std::string user_prompt =
+        build_scenes_user_prompt(scenes, new_units, texts);
+    result.ran = true;  // the LLM is about to be called (for the log row)
+    std::string raw;
+    try {
+        raw = scenes_llm(user_prompt);
+    } catch (const std::exception& e) {
+        result.error = std::string("scene model failed: ") + e.what();
+        return result;
+    }
+    if (raw.empty()) {
+        result.error = "scene model returned no text";
+        return result;
+    }
+    const std::vector<SceneDecision> decisions = parse_scene_decisions(raw);
+    if (decisions.empty()) return result;  // the model says: no change
+
+    // Apply with the cap enforced by the engine (the LLM owns merges; the
+    // engine only refuses to grow past kSceneMaxScenes).
+    std::set<std::string> names;
+    std::map<std::string, int> heat_by_name;
+    for (const MemoryDb::SceneRow& scene : scenes) {
+        names.insert(scene.name);
+        heat_by_name[scene.name] = scene.heat;
+    }
+    int applied = 0;
+    for (const SceneDecision& d : decisions) {
+        // A merge with nothing to absorb is an update; an update/create on
+        // a taken/free name falls over to the other action (lenient: the
+        // model's content must not be lost over a name collision).
+        std::string action = d.action;
+        if (action == "merge" && d.retire.empty()) action = "update";
+        if (action == "create" && names.count(d.name) > 0) action = "update";
+        if (action == "update" && names.count(d.name) == 0) action = "create";
+
+        int heat = d.heat;
+        if (action == "update") {
+            const auto it = heat_by_name.find(d.name);
+            heat = std::max(heat, (it == heat_by_name.end() ? 0 : it->second) + 1);
+        } else if (action == "merge") {
+            int absorbed = 0;
+            for (const std::string& retired : d.retire) {
+                const auto it = heat_by_name.find(retired);
+                if (it != heat_by_name.end()) absorbed += it->second;
+            }
+            heat = absorbed + 1;
+        }
+
+        // Cap check: the set size AFTER this decision (create/merge add one
+        // minus the retirees; update changes nothing).
+        int after = static_cast<int>(names.size());
+        if (action == "create" || action == "merge") after += 1;
+        if (action == "merge") {
+            int retired_in_set = 0;
+            for (const std::string& retired : d.retire) {
+                if (names.count(retired) > 0) retired_in_set++;
+            }
+            after -= retired_in_set;
+        }
+        if (after > kSceneMaxScenes) {
+            result.dropped++;
+            result.lines.push_back("scene " + d.name + " dropped (cap " +
+                                   std::to_string(kSceneMaxScenes) + ")");
+            continue;
+        }
+
+        if (!db.upsert_scene(d.name, d.summary, heat, d.content, generation_id, error)) {
+            return result;
+        }
+        names.insert(d.name);
+        heat_by_name[d.name] = heat;
+        result.applied_names.push_back(d.name);
+        applied++;
+        if (action == "create") result.created++;
+        if (action == "update") result.updated++;
+        if (action == "merge") result.merged++;
+        result.lines.push_back("scene " + d.name + " " + action + " (heat " +
+                               std::to_string(heat) + ")");
+        for (const std::string& retired : d.retire) {
+            if (!db.delete_scene_by_name(retired, error)) return result;
+            names.erase(retired);
+            heat_by_name.erase(retired);
+            result.lines.push_back("scene " + retired + " retired (merged into " +
+                                   d.name + ")");
+        }
+    }
+    result.changed = applied > 0;
+    return result;
+}
+
+std::string build_persona_user_prompt(
+    const std::vector<MemoryDb::SceneRow>& scenes,
+    const std::string& existing_persona) {
+    json::Array scene_arr;
+    long long included = 0;
+    for (const MemoryDb::SceneRow& scene : scenes) {
+        if (included + scene.content.size() > kPersonaSceneBudget) break;
+        included += scene.content.size();
+        json::Object o;
+        o["name"] = json::Value(scene.name);
+        o["summary"] = json::Value(scene.summary);
+        o["heat"] = json::Value(static_cast<long long>(scene.heat));
+        o["content"] = json::Value(scene.content);
+        scene_arr.push_back(json::Value(std::move(o)));
+    }
+    std::string prompt = "## Scene blocks (" + std::to_string(scenes.size()) + ")\n" +
+                         json::stringify(json::Value(std::move(scene_arr))) + "\n\n" +
+                         "## Current persona\n" +
+                         (existing_persona.empty() ? std::string("(none)") : existing_persona);
+    return prompt;
+}
+
+std::string parse_persona(const std::string& raw) {
+    const std::string text = strip_code_fences(raw);
+    if (text.empty()) return "";
+    json::Value parsed;
+    try {
+        parsed = json::parse(text);
+    } catch (const std::exception&) {
+        return "";
+    }
+    if (parsed.type() != json::Value::Type::Object || !parsed.has("persona")) {
+        return "";
+    }
+    std::string persona = parsed.at("persona").as_string("");
+    while (!persona.empty() && (persona.front() == ' ' || persona.front() == '\n')) {
+        persona.erase(persona.begin());
+    }
+    while (!persona.empty() && (persona.back() == ' ' || persona.back() == '\n')) {
+        persona.pop_back();
+    }
+    if (persona.empty() || persona.size() > static_cast<std::size_t>(kPersonaMaxChars)) {
+        return "";
+    }
+    return persona;
+}
+
+PersonaRefreshResult refresh_persona(
+    MemoryDb& db,
+    const std::function<std::string(const std::string&)>& persona_llm,
+    const std::string& generation_id, std::string& error) {
+    PersonaRefreshResult result;
+    const std::vector<MemoryDb::SceneRow> scenes = db.scenes(error);
+    if (!error.empty()) return result;
+    if (scenes.empty()) return result;  // not ran: no scenes to distill from
+    // The scenes the prompt will carry (heat-first, content budgeted) - the
+    // same selection build_persona_user_prompt makes, for the provenance log.
+    long long included = 0;
+    for (const MemoryDb::SceneRow& scene : scenes) {
+        if (included + scene.content.size() > kPersonaSceneBudget) break;
+        included += scene.content.size();
+        result.scene_names.push_back(scene.name);
+    }
+    std::string existing;
+    const std::optional<MemoryDb::PersonaRow> current = db.persona(error);
+    if (!error.empty()) return result;
+    if (current) existing = current->content;
+
+    const std::string user_prompt = build_persona_user_prompt(scenes, existing);
+    result.ran = true;  // the LLM is about to be called (for the log row)
+    std::string raw;
+    try {
+        raw = persona_llm(user_prompt);
+    } catch (const std::exception& e) {
+        result.error = std::string("persona model failed: ") + e.what();
+        return result;
+    }
+    if (raw.empty()) {
+        result.error = "persona model returned no text";
+        return result;
+    }
+    const std::string persona = parse_persona(raw);
+    if (persona.empty()) {
+        result.error = "persona output unparseable or over the cap";
+        return result;
+    }
+    if (!db.upsert_persona(persona, generation_id, error)) return result;
+    result.changed = persona != existing;
+    return result;
 }
 
 // ── Status ───────────────────────────────────────────────────────────────

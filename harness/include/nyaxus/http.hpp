@@ -61,6 +61,12 @@ class SseWriter {
     bool client_gone() const;
 
    private:
+    // One process-wide lock for all SSE frames: socket_write_all loops
+    // send(), so two publishers on the same socket (wave-pool worker
+    // threads, HTTP routes, the run thread) would interleave partial
+    // frames without it.
+    static std::mutex& write_lock();
+
     SocketHandle handle_;
 };
 

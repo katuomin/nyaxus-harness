@@ -792,6 +792,232 @@ int main() {
         std::filesystem::remove(legacy_path.string() + "-shm", lec);
     }
 
+    // ── v6 -> v7 migration (pre-existing bank) ──────────────────────────
+    std::cout << "v6 -> v7 migration:\n";
+    std::cout.flush();
+    {
+        // A bank from the generation-log era: full v6 schema (with
+        // memory_generations), stamped v6, missing the scene/persona tables.
+        // Build it with the current engine, then drop the v7 tables and the
+        // stamp to simulate the older build.
+        const std::filesystem::path legacy_path =
+            std::filesystem::temp_directory_path() /
+            ("nyaxus-memtest-legacy-v6-" + std::to_string(stamp) + ".db");
+        {
+            MemoryDb seed(legacy_path);
+            std::string serr;
+            custom::RetainResult r = custom::retain(
+                seed, embed_model,
+                direct_spec("A v6 bank gains the scene tables on migration.", "run-v7"),
+                nullptr, serr);
+            check(r.stored == 1 && serr.empty(), "seed the legacy v6 bank");
+        }
+        sqlite3* legacy = nullptr;
+        check(sqlite3_open(legacy_path.string().c_str(), &legacy) == SQLITE_OK,
+              "reopen the legacy v6 bank raw");
+        if (legacy) {
+            char* serr = nullptr;
+            sqlite3_exec(legacy,
+                         "DROP TABLE IF EXISTS memory_scenes;"
+                         " DROP TABLE IF EXISTS memory_persona;"
+                         " PRAGMA user_version = 6;",
+                         nullptr, nullptr, &serr);
+            if (serr) {
+                check(false, std::string("drop the v7 tables: ") + serr);
+                sqlite3_free(serr);
+            }
+            sqlite3_close(legacy);
+        }
+        MemoryDb legacy_db(legacy_path);
+        std::string merr;
+        check(legacy_db.upsert_scene("migrated-scene", "s", 1, "content",
+                                     "gen:test", merr) > 0 && merr.empty(),
+              "v6 bank migrates and accepts scene upserts");
+        check(legacy_db.upsert_persona("persona", "gen:test", merr) == 1 && merr.empty(),
+              "v6 bank migrates and accepts persona upserts");
+        check(legacy_db.scene_count(merr) == 1, "scene count on the migrated bank");
+        std::error_code lec;
+        std::filesystem::remove(legacy_path, lec);
+        std::filesystem::remove(legacy_path.string() + "-wal", lec);
+        std::filesystem::remove(legacy_path.string() + "-shm", lec);
+    }
+
+    // ── L2 scene refresh + L3 persona ───────────────────────────────────
+    std::cout << "scene + persona:\n";
+    std::cout.flush();
+    {
+        // parse_scene_decisions: valid kept, bad slug / unknown action / non-JSON dropped.
+        const std::vector<custom::SceneDecision> parsed = custom::parse_scene_decisions(
+            "[{\"action\":\"create\",\"name\":\"good-slug\",\"summary\":\"s\",\"heat\":1,"
+            "\"content\":\"c\"},"
+            "{\"action\":\"create\",\"name\":\"Bad Slug\",\"summary\":\"s\",\"heat\":1,"
+            "\"content\":\"c\"},"
+            "{\"action\":\"nope\",\"name\":\"other\",\"summary\":\"s\",\"heat\":1,"
+            "\"content\":\"c\"}]");
+        check(parsed.size() == 1 && parsed.front().name == "good-slug",
+              "parse_scene_decisions keeps only valid decisions");
+        check(custom::parse_scene_decisions("not json").empty(),
+              "parse_scene_decisions: non-JSON -> no change");
+
+        // First refresh: whole bank (no watermark yet), two creates.
+        std::string prompt_seen;
+        custom::SceneRefreshResult sr = custom::refresh_scenes(
+            db,
+            [&prompt_seen](const std::string& prompt) {
+                prompt_seen = prompt;
+                return "[{\"action\":\"create\",\"name\":\"city-facts\",\"summary\":\"city\","
+                       "\"heat\":1,\"content\":\"# City\n\nCity facts.\"},"
+                       "{\"action\":\"create\",\"name\":\"pet-facts\",\"summary\":\"pets\","
+                       "\"heat\":1,\"content\":\"# Pets\n\nPet facts.\"}]";
+            },
+            "gen:scene:test-create", error);
+        check(sr.ran && sr.created == 2 && sr.changed && sr.unit_ids.size() >= 5 &&
+                  prompt_seen.find("## Existing scenes") != std::string::npos &&
+                  prompt_seen.find("## New memories") != std::string::npos,
+              "first scene refresh: whole-bank watermark, 2 creates, prompt sections");
+        check(db.scene_count(error) == 2, "scene count is 2 after creates");
+        check(!db.max_scene_updated_at(error).empty(), "scene watermark is set");
+
+        // Update: heat bump + content replacement (new units first: the
+        // watermark only advances past units the refresh has seen).
+        for (int i = 0; i < 5; i++) {
+            custom::retain(
+                db, embed_model,
+                direct_spec("A scene-refresh update filler unit number " + std::to_string(i) + ".",
+                            "run-scene-update-" + std::to_string(i)),
+                nullptr, error);
+        }
+        sr = custom::refresh_scenes(
+            db,
+            [](const std::string&) {
+                return "[{\"action\":\"update\",\"name\":\"city-facts\",\"summary\":\"city\","
+                       "\"heat\":7,\"content\":\"# City v2\n\nCity facts, updated.\"}]";
+            },
+            "gen:scene:test-update", error);
+        check(sr.ran && sr.updated == 1 && sr.changed, "scene update applied");
+        {
+            const std::vector<MemoryDb::SceneRow> scenes = db.scenes(error);
+            bool found = false;
+            for (const MemoryDb::SceneRow& s : scenes) {
+                if (s.name == "city-facts") {
+                    found = true;
+                    check(s.heat == 7 && s.content.find("City v2") != std::string::npos,
+                          "updated scene carries the new heat and content");
+                }
+            }
+            check(found, "updated scene present");
+        }
+
+        // Merge: retire both scenes into one (heat = sum of absorbed + 1).
+        for (int i = 0; i < 5; i++) {
+            custom::retain(
+                db, embed_model,
+                direct_spec("A scene-refresh merge filler unit number " + std::to_string(i) + ".",
+                            "run-scene-merge-" + std::to_string(i)),
+                nullptr, error);
+        }
+        sr = custom::refresh_scenes(
+            db,
+            [](const std::string&) {
+                return "[{\"action\":\"merge\",\"name\":\"city-and-pets\",\"summary\":\"merged\","
+                       "\"heat\":0,\"content\":\"# Merged\n\nCity and pets.\","
+                       "\"retire\":[\"city-facts\",\"pet-facts\"]}]";
+            },
+            "gen:scene:test-merge", error);
+        check(sr.ran && sr.merged == 1 && sr.changed, "scene merge applied");
+        check(db.scene_count(error) == 1, "scene count is 1 after merge");
+        {
+            const std::vector<MemoryDb::SceneRow> scenes = db.scenes(error);
+            check(scenes.size() == 1 && scenes.front().name == "city-and-pets" &&
+                      scenes.front().heat == 9,  // 7 + 1 absorbed, + 1 for the merge
+                  "merged scene absorbed both heats (7+1+1=9)");
+        }
+
+        // No new units since the watermark -> not ran.
+        sr = custom::refresh_scenes(
+            db, [](const std::string&) { return "[]"; }, "gen:scene:test-idle", error);
+        check(!sr.ran && !sr.changed, "no new units -> refresh not ran");
+
+        // LLM failure: the endpoint throws, state is preserved.
+        for (int i = 0; i < 5; i++) {
+            custom::retain(
+                db, embed_model,
+                direct_spec("A scene-refresh filler unit number " + std::to_string(i) + ".",
+                            "run-scene-filler-" + std::to_string(i)),
+                nullptr, error);
+        }
+        sr = custom::refresh_scenes(
+            db,
+            [](const std::string&) -> std::string {
+                throw std::runtime_error("endpoint down");
+            },
+            "gen:scene:test-fail", error);
+        check(sr.ran && !sr.changed && !sr.error.empty(),
+              "LLM failure: error set, no change");
+        check(db.scene_count(error) == 1, "scene count unchanged after LLM failure");
+
+        // Cap: 25 creates against a 1-scene bank -> capped at 20, rest dropped.
+        std::string cap_json = "[";
+        for (int i = 0; i < 25; i++) {
+            if (i) cap_json += ",";
+            cap_json += "{\"action\":\"create\",\"name\":\"cap-" + std::to_string(i) +
+                        "\",\"summary\":\"s\",\"heat\":1,\"content\":\"c\"}";
+        }
+        cap_json += "]";
+        sr = custom::refresh_scenes(
+            db, [cap_json](const std::string&) { return cap_json; },
+            "gen:scene:test-cap", error);
+        check(sr.ran && sr.dropped > 0 && db.scene_count(error) == 20,
+              "scene cap enforced (20, extras dropped)");
+
+        // Persona: created from the scenes.
+        custom::PersonaRefreshResult pr = custom::refresh_persona(
+            db,
+            [](const std::string& prompt) {
+                check(prompt.find("## Scene blocks") != std::string::npos &&
+                          prompt.find("## Current persona") != std::string::npos,
+                      "persona prompt carries scenes and current persona");
+                return "{\"persona\": \"# Persona\\n\\nUser facts.\"}";
+            },
+            "gen:persona:test-create", error);
+        check(pr.ran && pr.changed && !pr.scene_names.empty(), "persona created");
+        {
+            const std::optional<MemoryDb::PersonaRow> p = db.persona(error);
+            check(p.has_value() && p->content.find("User facts") != std::string::npos,
+                  "persona stored");
+        }
+
+        // Persona: identical text -> changed=false (no churn).
+        pr = custom::refresh_persona(
+            db,
+            [](const std::string&) {
+                return "{\"persona\": \"# Persona\n\nUser facts.\"}";
+            },
+            "gen:persona:test-same", error);
+        check(pr.ran && !pr.changed, "persona unchanged on identical text");
+
+        // Persona: unparseable output -> the current one is preserved.
+        pr = custom::refresh_persona(
+            db,
+            [](const std::string&) { return "not json at all"; },
+            "gen:persona:test-bad", error);
+        check(pr.ran && !pr.changed && !pr.error.empty(),
+              "persona: unparseable output keeps the current one");
+        {
+            const std::optional<MemoryDb::PersonaRow> p = db.persona(error);
+            check(p.has_value() && p->content.find("User facts") != std::string::npos,
+                  "persona preserved after unparseable output");
+        }
+
+        // parse_persona: valid / non-JSON / over-cap.
+        check(custom::parse_persona("{\"persona\": \"x\"}") == "x",
+              "parse_persona: valid");
+        check(custom::parse_persona("nope").empty(), "parse_persona: non-JSON");
+        const std::string big =
+            "{\"persona\": \"" + std::string(5000, 'a') + "\"}";
+        check(custom::parse_persona(big).empty(), "parse_persona: over-cap rejected");
+    }
+
     // ── Status ──────────────────────────────────────────────────────────
     std::cout << "status:\n";
     std::cout.flush();

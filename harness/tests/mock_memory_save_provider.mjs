@@ -3,13 +3,16 @@
 // Behavior (stateful, per server lifetime):
 //   GET  /v1/models            -> one model, so the daemon's discovery succeeds
 //   POST /v1/chat/completions  -> SSE stream
-//     request 1: a memory.save tool call with a durable fact
-//     request 2+: a plain text answer (ends the daemon's tool loop)
+//     request 1: memory.save with an explicit type (world: a stable
+//                environment fact)
+//     request 2: memory.save without a type (defaults to experience)
+//     request 3+: a plain text answer (ends the daemon's tool loop)
 //
 // The test asserts the run completes WITHOUT any approve/deny command and
-// that the fact lands in the memory bank - i.e. memory.save no longer sits
-// behind the per-call approval gate (the memory-enabled check is the only
-// gate).
+// that both facts land in the memory bank with the right types - i.e.
+// memory.save no longer sits behind the per-call approval gate (the
+// memory-enabled check is the only gate) and the optional type param is
+// honored.
 //
 // Tool-call arguments follow the OpenAI convention: a JSON object string
 // ("{\"text\":\"...\"}"), as the daemon's dispatch requires.
@@ -57,7 +60,29 @@ const server = http.createServer((req, res) => {
                     id: "call_1",
                     function: {
                       name: "memory.save",
-                      arguments: JSON.stringify({ text: "The vault passphrase is iron-88." }),
+                      arguments: JSON.stringify({ text: "The vault passphrase is iron-88.", type: "world" }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      } else if (completions === 2) {
+        send({
+          id: `mock-${completions}`,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_2",
+                    function: {
+                      name: "memory.save",
+                      arguments: JSON.stringify({ text: "We agreed to keep the relay secret from the guild." }),
                     },
                   },
                 ],

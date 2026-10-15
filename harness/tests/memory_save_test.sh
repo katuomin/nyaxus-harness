@@ -5,7 +5,8 @@
 #   - a run whose model calls memory.save completes without any
 #     approve/deny command (the global memory-enabled check is the only
 #     gate; the tool is not offered at all while the bank is unreachable)
-#   - the saved fact lands in the memory bank (direct retain path)
+#   - the saved facts land in the memory bank (direct retain path) with
+#     the requested type (world) and the default type (experience)
 #
 # Usage: harness/tests/memory_save_test.sh [path-to-nyaxus_daemon]
 set -u
@@ -69,10 +70,21 @@ done
 [ "$DONE" = "1" ] || fail "run did not complete without approval (see $WORKDIR/daemon.log)"
 echo "run completed ungated"
 
-echo "== the saved fact is in the memory bank =="
+echo "== the saved facts are in the memory bank with the right types =="
 BANK="$(curl -sf "$BASE/memory/bank?limit=50&state=all")"
-printf '%s' "$BANK" | grep -q "iron-88" || fail "saved fact missing from the bank: $BANK"
-echo "bank contains the saved fact"
+TYPES="$(printf '%s' "$BANK" | "$NODE" -e '
+    let d = "";
+    process.stdin.on("data", (c) => { d += c; });
+    process.stdin.on("end", () => {
+        const units = (JSON.parse(d).units) || [];
+        const world = units.find((u) => (u.text || "").includes("iron-88"));
+        const defaultType = units.find((u) => (u.text || "").includes("relay secret"));
+        process.stdout.write(
+            (world ? world.type : "missing") + "/" +
+            (defaultType ? defaultType.type : "missing"));
+    });')"
+[ "$TYPES" = "world/experience" ] || fail "wrong unit types (want world/experience, got $TYPES): $BANK"
+echo "bank contains both facts, typed world + experience"
 
 echo
 echo "MEMORY_SAVE_TEST_PASSED"

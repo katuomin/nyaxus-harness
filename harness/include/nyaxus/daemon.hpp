@@ -572,6 +572,36 @@ std::string generate_title(const std::string& message);
 
 std::string run_memory_extraction(const std::string& content);
 
+// The extraction prompt, in one place: run_memory_extraction sends it, the
+// provenance log references it (id + revision + sha256). The sha is computed
+// from the same text, so it stays in sync with the prompt.
+static const std::string& memory_extraction_prompt();
+static std::string memory_extraction_prompt_sha256();
+static constexpr const char* kMemoryExtractionPromptId = "memory-extraction";
+static constexpr const char* kMemoryExtractionPromptRevision = "memory-extraction:v2";
+
+// The LLM semantic-dedup judge: batch-compares new extract candidates against
+// a recalled pool of existing units and decides store/skip/update/merge.
+std::string run_memory_dedup(const std::string& user_prompt);
+static const std::string& memory_dedup_prompt();
+static std::string memory_dedup_prompt_sha256();
+static constexpr const char* kMemoryDedupPromptId = "memory-dedup";
+static constexpr const char* kMemoryDedupPromptRevision = "memory-dedup:v1";
+
+    // L2 scene refresh + L3 persona: the same small-model endpoint as
+    // extraction/dedup (structured tasks, no thinking). The prompts own the
+    // contract; the daemon applies the model's decisions to the bank.
+    std::string run_memory_scenes(const std::string& user_prompt);
+    std::string run_memory_persona(const std::string& user_prompt);
+    static const std::string& memory_scenes_prompt();
+    static std::string memory_scenes_prompt_sha256();
+    static constexpr const char* kMemoryScenesPromptId = "memory-scenes";
+    static constexpr const char* kMemoryScenesPromptRevision = "memory-scenes:v1";
+    static const std::string& memory_persona_prompt();
+    static std::string memory_persona_prompt_sha256();
+    static constexpr const char* kMemoryPersonaPromptId = "memory-persona";
+    static constexpr const char* kMemoryPersonaPromptRevision = "memory-persona:v1";
+
     static constexpr std::size_t kJourneyExistingCapBytes = 8192;
 
     static constexpr std::size_t kJourneyTurnsCapBytes = 8192;
@@ -591,6 +621,11 @@ int process_custom_sweep_jobs(int max_jobs = 1);
 http::Response memory_consolidate(const http::Request& request);
 
 http::Response memory_journey_get(const http::Request& request);
+
+http::Response memory_generations_get(const http::Request& request);
+
+// L2 scene blocks + L3 persona (GET /memory/scenes, ?full=1 for content).
+http::Response memory_scenes_get(const http::Request& request);
 
 http::Response sources_route(const http::Request& request);
 
@@ -881,6 +916,10 @@ void install(http::Server& server);
         bool sudo_gate = false;
         std::string sudo_password;
         std::string sudo_scope;
+        // Only one terminal call may park on the sudo gate at a time: the
+        // run carries a single pending-call slot, so a concurrent wave call
+        // waits its turn here instead of clobbering the gate's state.
+        std::mutex sudo_gate_mutex;
         // @-mentioned paths (exact spans from the composer, so they may
         // contain spaces): verified and injected as a per-turn note so the
         // model sees what exists at each referenced path.
@@ -1070,6 +1109,13 @@ http::Response migrate_memory(const http::Request& request);
         bool fallback = false;
         json::Array results;
         int suppressed_below_floor = 0;  // custom recall: hits dropped by the floor
+        // Custom recall budget hardening (partial-result metadata): the
+        // deadline expired at a stage boundary (results are partial, in RRF
+        // order, rerank skipped), hits dropped by the token budget, and hits
+        // truncated to the per-item cap.
+        bool timed_out = false;
+        int budget_dropped = 0;
+        int truncated = 0;
     };
 
 MemoryRecallOutcome memory_recall_core(const std::string& query, const std::string& session_id, const std::string& profile, long long max_tokens, long long timeout_ms);
@@ -1535,7 +1581,7 @@ std::string memory_use_tool(const std::string& ids, const std::string& run_id);
 
 std::string memory_act_tool(const std::string& ids, const std::string& run_id);
 
-std::string memory_save_tool(const std::string& text, const std::string& sid, const std::string& profile_id);
+std::string memory_save_tool(const std::string& text, const std::string& type, const std::string& sid, const std::string& profile_id);
 
 std::string status_set_tool(const std::string& state, const std::string& sid, const std::string& profile_id);
 

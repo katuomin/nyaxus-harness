@@ -569,6 +569,336 @@ std::string Daemon::generate_title(const std::string& message)
         return title;
     }
 
+const std::string& Daemon::memory_extraction_prompt()
+{
+    static const std::string prompt =
+        "You are a memory extractor for an AI assistant's long-term memory "
+        "bank. Read the conversation turn below and extract the durable "
+        "facts worth remembering for future sessions.\n\n"
+        "Return ONLY a JSON object (no prose, no code fence) of exactly "
+        "this shape:\n"
+        "{\"candidates\": [{\"type\": \"...\", \"text\": \"...\", "
+        "\"confidence\": 0.0}]}\n\n"
+        "Types - pick exactly one per candidate:\n"
+        "- world: stable facts about the user and their environment - "
+        "identity, preferences, relationships, machines, services, "
+        "credentials, project layout. These stay true for a long time; "
+        "write them as declarative statements (\"the user prefers X\", "
+        "\"host Y runs Z at W\").\n"
+        "- experience: objective events that happened - decisions made, "
+        "work completed, incidents, plans set. Never opinions.\n"
+        "- observation: findings from investigation that may change - "
+        "runtime state, process state, temporary measurements.\n"
+        "- mental_model: how the user thinks - frameworks, values, "
+        "worldview.\n"
+        "- procedure: reusable how-to steps - commands, workflows, "
+        "recipes that work.\n"
+        "- lesson: hard-won lessons - pitfalls, what did not work and "
+        "why.\n\n"
+        "Boundary rules:\n"
+        "- A fact that will still be true next month is world, not "
+        "observation; an event that is over is experience.\n"
+        "- In doubt between world and experience, prefer world for "
+        "state and experience for events.\n\n"
+        "Rules:\n"
+        "- \"text\" is one or two self-contained sentences, written so a "
+        "future session can read it standalone: no references to \"this "
+        "conversation\" or \"the assistant\"; refer to the human as "
+        "\"the user\".\n"
+        "- \"confidence\" is a number between 0 and 1 reflecting how "
+        "directly the turn states the fact.\n"
+        "- Extract only what the turn explicitly states or directly "
+        "implies: decisions, constraints, preferences, environment facts, "
+        "hard-won lessons, procedures. Skip small talk, ephemeral task "
+        "state, and common knowledge.\n"
+        "- Never invent facts. If nothing is worth remembering, return "
+        "{\"candidates\": []}";
+    return prompt;
+}
+
+std::string Daemon::memory_extraction_prompt_sha256()
+{
+    static const std::string sha = sha256_hex(memory_extraction_prompt());
+    return sha;
+}
+
+const std::string& Daemon::memory_dedup_prompt()
+{
+    static const std::string prompt =
+        "You are a memory deduplication judge. You are given a pool of "
+        "EXISTING memories and a list of NEW candidate memories. For each new "
+        "candidate, decide how to handle it relative to the existing pool.\n\n"
+        "Actions:\n"
+        "- \"store\": the candidate is new information not covered by the pool. "
+        "Store it as-is.\n"
+        "- \"skip\": an existing memory already covers it better (more "
+        "specific, clearer, or the candidate adds nothing). Discard the "
+        "candidate.\n"
+        "- \"update\": same fact or event, and the candidate is more specific, "
+        "more recent, or corrects the existing memory. The merged text "
+        "replaces the existing one(s).\n"
+        "- \"merge\": same fact or same evolving story, and the candidate and "
+        "the existing memory(ies) are complementary and non-contradictory. "
+        "Merge them into one complete memory.\n\n"
+        "For \"update\"/\"merge\" you MUST provide:\n"
+        "- \"target_ids\": the existing memory ids being replaced/retired (one "
+        "or more, from the candidate's related list).\n"
+        "- \"merged_content\": the final, self-contained memory text (a future "
+        "session reads it standalone).\n"
+        "- \"merged_type\": the best type for the final text: "
+        "world|experience|observation|mental_model|procedure|lesson.\n\n"
+        "Output ONLY a JSON array, one element per new candidate, in the same "
+        "order as the candidates were given:\n"
+        "[\n"
+        "  {\"id\": \"<candidate id>\", \"action\": "
+        "\"store|skip|update|merge\", \"target_ids\": [<existing id>], "
+        "\"merged_content\": \"...\", \"merged_type\": \"...\"}\n"
+        "]\n\n"
+        "Rules:\n"
+        "- When a candidate's related list is empty, output action=\"store\".\n"
+        "- Never invent facts not present in the candidate or the existing "
+        "memories.\n"
+        "- Do not output anything other than the JSON array.";
+    return prompt;
+}
+
+std::string Daemon::memory_dedup_prompt_sha256()
+{
+    static const std::string sha = sha256_hex(memory_dedup_prompt());
+    return sha;
+}
+
+std::string Daemon::run_memory_dedup(const std::string& user_prompt)
+{
+        // Same small model as extraction (memory.extract_* preferred, aux
+        // fallback): dedup is a structured-JSON task, so thinking is pure
+        // overhead.
+        provider::Config cfg;
+        bool configured = false;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            if (!config_.memory_extract_endpoint.empty()) {
+                cfg.endpoint = config_.memory_extract_endpoint;
+                cfg.model = config_.memory_extract_model;
+                cfg.api_key = config_.memory_extract_api_key;
+                configured = true;
+            } else if (config_.auxiliary.has_value() &&
+                       !config_.auxiliary->endpoint.empty()) {
+                cfg = *config_.auxiliary;
+                configured = true;
+            }
+        }
+        if (!auxiliary_provider_ || !configured) {
+            throw std::runtime_error(
+                "no memory extraction endpoint is configured "
+                "(memory.extract_endpoint or auxiliary.endpoint)");
+        }
+        cfg.temperature = 0.2;
+        cfg.no_thinking = true;
+        if (cfg.max_tokens <= 0) cfg.max_tokens = 2048;
+        cfg.stall_timeout_ms = provider::kLegacyStallTimeoutMs;
+        const std::string& kPrompt = memory_dedup_prompt();
+        const std::vector<provider::ChatMessage> messages = {
+            {"system", kPrompt},
+            {"user", user_prompt},
+        };
+        std::string out;
+        std::string error;
+        const bool ok = auxiliary_provider_->stream(
+            cfg, messages,
+            [&](const std::string& type, const json::Value& payload) {
+                if (type == "text.delta") out += payload["text"].as_string();
+            },
+            CancellationToken{}, &error);
+        if (!ok) {
+            throw std::runtime_error(error.empty() ? "auxiliary dedup failed"
+                                                   : error);
+        }
+        if (out.empty()) {
+            throw std::runtime_error("auxiliary dedup returned no text");
+        }
+        return out;
+    }
+
+const std::string& Daemon::memory_scenes_prompt()
+{
+    static const std::string prompt =
+        "You are a memory consolidation architect. You are given the "
+        "EXISTING scene blocks (topic-level narrative summaries of a user's "
+        "memory bank) and NEW memory units added since the last "
+        "consolidation.\n\n"
+        "A scene block is a coherent markdown narrative of ONE topic area of "
+        "the user's life and work - not a list. Keep the scene set current:\n"
+        "- \"update\" an existing scene when a new unit fits its topic "
+        "(preferred);\n"
+        "- \"merge\" overlapping scenes into one broader scene (retire the "
+        "absorbed ones);\n"
+        "- \"create\" a new scene only for a genuinely new topic.\n\n"
+        "For every change output the FULL new content of the affected scene "
+        "(never a diff or an append).\n\n"
+        "Output ONLY a JSON array (no prose, no code fence), one element per "
+        "changed scene:\n"
+        "[{\"action\": \"create|update|merge\", \"name\": "
+        "\"lowercase-hyphenated-slug\", \"summary\": \"one sentence\", "
+        "\"heat\": <integer>, \"content\": \"full markdown narrative\", "
+        "\"retire\": [\"absorbed slug\"]}]\n\n"
+        "Rules:\n"
+        "- \"name\": lowercase letters, digits and hyphens only, at most 64 "
+        "characters.\n"
+        "- \"heat\": for update = the scene's old heat + 1; for merge = the "
+        "sum of the absorbed scenes' heats + 1; for create = 1.\n"
+        "- \"retire\" is only for merge: the existing scene slugs absorbed "
+        "into the new one.\n"
+        "- \"content\" is under 4000 characters, written so a future session "
+        "reads it standalone: no references to \"this conversation\"; refer "
+        "to the human as \"the user\".\n"
+        "- Never invent facts not present in the new units or the existing "
+        "scenes.\n"
+        "- If the new units add nothing to any scene, output [].";
+    return prompt;
+}
+
+std::string Daemon::memory_scenes_prompt_sha256()
+{
+    static const std::string sha = sha256_hex(memory_scenes_prompt());
+    return sha;
+}
+
+std::string Daemon::run_memory_scenes(const std::string& user_prompt)
+{
+        // Same small model as extraction (memory.extract_* preferred, aux
+        // fallback): structured narrative work, thinking is overhead.
+        provider::Config cfg;
+        bool configured = false;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            if (!config_.memory_extract_endpoint.empty()) {
+                cfg.endpoint = config_.memory_extract_endpoint;
+                cfg.model = config_.memory_extract_model;
+                cfg.api_key = config_.memory_extract_api_key;
+                configured = true;
+            } else if (config_.auxiliary.has_value() &&
+                       !config_.auxiliary->endpoint.empty()) {
+                cfg = *config_.auxiliary;
+                configured = true;
+            }
+        }
+        if (!auxiliary_provider_ || !configured) {
+            throw std::runtime_error(
+                "no memory extraction endpoint is configured "
+                "(memory.extract_endpoint or auxiliary.endpoint)");
+        }
+        cfg.temperature = 0.3;
+        cfg.no_thinking = true;
+        if (cfg.max_tokens <= 0) cfg.max_tokens = 4096;
+        cfg.stall_timeout_ms = provider::kLegacyStallTimeoutMs;
+        const std::string& kPrompt = memory_scenes_prompt();
+        const std::vector<provider::ChatMessage> messages = {
+            {"system", kPrompt},
+            {"user", user_prompt},
+        };
+        std::string out;
+        std::string error;
+        const bool ok = auxiliary_provider_->stream(
+            cfg, messages,
+            [&](const std::string& type, const json::Value& payload) {
+                if (type == "text.delta") out += payload["text"].as_string();
+            },
+            CancellationToken{}, &error);
+        if (!ok) {
+            throw std::runtime_error(error.empty()
+                                         ? "auxiliary scene refresh failed"
+                                         : error);
+        }
+        if (out.empty()) {
+            throw std::runtime_error("auxiliary scene refresh returned no text");
+        }
+        return out;
+    }
+
+const std::string& Daemon::memory_persona_prompt()
+{
+    static const std::string prompt =
+        "You are a persona architect. You are given the SCENE BLOCKS of a "
+        "user's memory bank (topic-level narratives) and, when present, the "
+        "CURRENT persona document.\n\n"
+        "Rewrite the persona: a compact markdown narrative profile of the "
+        "user that the assistant carries in context on every turn. "
+        "Structure it as:\n"
+        "1. Who the user is - role, context, stable facts.\n"
+        "2. What they work on and care about - active projects, interests, "
+        "current state.\n"
+        "3. How to work with them - communication preferences, decision "
+        "patterns, recurring constraints.\n"
+        "4. Recent evolution - what has changed lately, with dates when "
+        "known.\n\n"
+        "Rules:\n"
+        "- Under 2000 characters total.\n"
+        "- Every claim must be grounded in the scene content: no "
+        "over-speculation, no facts from outside the scenes.\n"
+        "- Keep it current: fold reinforcement into existing lines, drop "
+        "what is stale.\n"
+        "- Output ONLY JSON: {\"persona\": \"the full markdown persona\"}";
+    return prompt;
+}
+
+std::string Daemon::memory_persona_prompt_sha256()
+{
+    static const std::string sha = sha256_hex(memory_persona_prompt());
+    return sha;
+}
+
+std::string Daemon::run_memory_persona(const std::string& user_prompt)
+{
+        // Same small model as extraction: a bounded rewrite task.
+        provider::Config cfg;
+        bool configured = false;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            if (!config_.memory_extract_endpoint.empty()) {
+                cfg.endpoint = config_.memory_extract_endpoint;
+                cfg.model = config_.memory_extract_model;
+                cfg.api_key = config_.memory_extract_api_key;
+                configured = true;
+            } else if (config_.auxiliary.has_value() &&
+                       !config_.auxiliary->endpoint.empty()) {
+                cfg = *config_.auxiliary;
+                configured = true;
+            }
+        }
+        if (!auxiliary_provider_ || !configured) {
+            throw std::runtime_error(
+                "no memory extraction endpoint is configured "
+                "(memory.extract_endpoint or auxiliary.endpoint)");
+        }
+        cfg.temperature = 0.3;
+        cfg.no_thinking = true;
+        if (cfg.max_tokens <= 0) cfg.max_tokens = 2048;
+        cfg.stall_timeout_ms = provider::kLegacyStallTimeoutMs;
+        const std::string& kPrompt = memory_persona_prompt();
+        const std::vector<provider::ChatMessage> messages = {
+            {"system", kPrompt},
+            {"user", user_prompt},
+        };
+        std::string out;
+        std::string error;
+        const bool ok = auxiliary_provider_->stream(
+            cfg, messages,
+            [&](const std::string& type, const json::Value& payload) {
+                if (type == "text.delta") out += payload["text"].as_string();
+            },
+            CancellationToken{}, &error);
+        if (!ok) {
+            throw std::runtime_error(error.empty()
+                                         ? "auxiliary persona refresh failed"
+                                         : error);
+        }
+        if (out.empty()) {
+            throw std::runtime_error("auxiliary persona refresh returned no text");
+        }
+        return out;
+    }
+
 std::string Daemon::run_memory_extraction(const std::string& content)
 {
         // The memory-extraction endpoint (memory.extract_*) is preferred -
@@ -603,28 +933,7 @@ std::string Daemon::run_memory_extraction(const std::string& content)
         // One-shot auxiliary call: the legacy silence cap (the provider no
         // longer resolves 0 on its own).
         cfg.stall_timeout_ms = provider::kLegacyStallTimeoutMs;
-        static const char* kPrompt =
-            "You are a memory extractor for an AI assistant's long-term memory "
-            "bank. Read the conversation turn below and extract the durable "
-            "facts worth remembering for future sessions.\n\n"
-            "Return ONLY a JSON object (no prose, no code fence) of exactly "
-            "this shape:\n"
-            "{\"candidates\": [{\"type\": \"...\", \"text\": \"...\", "
-            "\"confidence\": 0.0}]}\n\n"
-            "Rules:\n"
-            "- \"type\" is one of: world, experience, observation, "
-            "mental_model, procedure, lesson.\n"
-            "- \"text\" is one or two self-contained sentences, written so a "
-            "future session can read it standalone: no references to \"this "
-            "conversation\", \"the user\", or \"the assistant\".\n"
-            "- \"confidence\" is a number between 0 and 1 reflecting how "
-            "directly the turn states the fact.\n"
-            "- Extract only what the turn explicitly states or directly "
-            "implies: decisions, constraints, preferences, environment facts, "
-            "hard-won lessons, procedures. Skip small talk, ephemeral task "
-            "state, and common knowledge.\n"
-            "- Never invent facts. If nothing is worth remembering, return "
-            "{\"candidates\": []}.";
+        const std::string& kPrompt = memory_extraction_prompt();
         const std::vector<provider::ChatMessage> messages = {
             {"system", kPrompt},
             {"user", content},
@@ -650,6 +959,7 @@ std::string Daemon::run_memory_extraction(const std::string& content)
 
 std::string Daemon::run_journey_update(const std::string& session_id)
 {
+        const auto journey_started = std::chrono::steady_clock::now();
         std::string error;
         MemoryDb* db = custom_db_or_null(error);
         if (!db) {
@@ -831,6 +1141,34 @@ std::string Daemon::run_journey_update(const std::string& session_id)
         if (!db->upsert_journey(session_id, profile, text, last_id, error)) {
             throw std::runtime_error(error.empty() ? "journey upsert failed" : error);
         }
+        // Provenance: best-effort log row (stable per session + watermark,
+        // so a retry of the same coverage is a no-op; failed attempts throw
+        // before this and are tracked by the outbox job itself).
+        {
+            MemoryDb::GenerationLog gen;
+            gen.generation_id = "gen:journey:" + session_id + ":" +
+                                std::to_string(last_id);
+            gen.kind = "journey";
+            gen.status = "succeeded";
+            gen.model_id = cfg.model;
+            gen.prompt_id = "journey";
+            gen.prompt_sha256 = sha256_hex(kJourneyPrompt);
+            json::Array inputs;
+            inputs.push_back(json::Value(session_id));
+            gen.input_refs = json::stringify(json::Value(std::move(inputs)));
+            json::Array outputs;
+            outputs.push_back(json::Value("journey:" + session_id));
+            gen.output_refs = json::stringify(json::Value(std::move(outputs)));
+            gen.session_id = session_id;
+            gen.latency_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - journey_started)
+                    .count();
+            std::string log_error;
+            if (db->insert_generation(gen, log_error) <= 0) {
+                log::warn("memory generations: log insert failed: " + log_error);
+            }
+        }
         return "journey updated to message " + std::to_string(last_id) +
                " (" + std::to_string(text.size()) + " bytes)";
     }
@@ -962,10 +1300,36 @@ int Daemon::process_custom_retain_jobs(int max_jobs )
             std::string operation_id;
             std::string err;
             bool permanent = false;
+            // Provenance: the extraction prompt's identity (id + revision +
+            // sha256) and a stable generation ref, so the retain job records
+            // the exact prompt that produced its units. Direct-text jobs
+            // (approval / save / import) carry their own keys from the
+            // enqueueing path.
+            std::string payload = job.payload;
+            try {
+                json::Value parsed = json::parse(payload);
+                if (parsed.type() == json::Value::Type::Object &&
+                    parsed["direct_text"].as_string("").empty()) {
+                    const std::string document_id =
+                        parsed["document_id"].as_string("");
+                    parsed["generation_id"] =
+                        json::Value("gen:extract:" + document_id);
+                    parsed["prompt_id"] = json::Value(kMemoryExtractionPromptId);
+                    parsed["prompt_revision"] =
+                        json::Value(kMemoryExtractionPromptRevision);
+                    parsed["prompt_sha256"] =
+                        json::Value(memory_extraction_prompt_sha256());
+                    payload = json::stringify(parsed);
+                }
+            } catch (...) {
+                // Malformed payload: process_retain_payload reports it as a
+                // permanent failure below.
+            }
             const bool ok = memory::custom::process_retain_payload(
-                *db, *embed, job.payload,
+                *db, *embed, payload,
                 [this](const std::string& content) { return run_memory_extraction(content); },
-                operation_id, err, permanent);
+                operation_id, err, permanent,
+                [this](const std::string& prompt) { return run_memory_dedup(prompt); });
             if (ok) {
                 store_->mark_memory_job_completed(job.id, operation_id);
                 log::info("memory: custom retain job " + std::to_string(job.id) +
@@ -1091,6 +1455,134 @@ int Daemon::process_custom_sweep_jobs(int max_jobs )
                          {"conflicts",
                           std::to_string(result.conflicts_proposed)}}));
                 }
+                // L2 scene refresh + L3 persona (derived distillation):
+                // fold the new units into the scene set, then rewrite the
+                // persona from the scenes.
+                // Best-effort: a failure warns and keeps the previous state
+                // (the L1 units are the source of truth) and never fails the
+                // sweep job.
+                try {
+                    std::string model_id;
+                    {
+                        std::lock_guard<std::mutex> lock(config_mutex_);
+                        if (!config_.memory_extract_model.empty()) {
+                            model_id = config_.memory_extract_model;
+                        } else if (config_.auxiliary.has_value()) {
+                            model_id = config_.auxiliary->model;
+                        }
+                    }
+                    const auto scene_start = std::chrono::steady_clock::now();
+                    const long long scene_ts =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+                    const std::string scene_gen = "gen:scene:" + std::to_string(scene_ts);
+                    memory::custom::SceneRefreshResult scene_result =
+                        memory::custom::refresh_scenes(
+                            *db,
+                            [this](const std::string& prompt) {
+                                return run_memory_scenes(prompt);
+                            },
+                            scene_gen, err);
+                    const long long scene_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - scene_start)
+                            .count();
+                    if (scene_result.ran) {
+                        json::Array in_refs, out_refs;
+                        for (const long long unit_id : scene_result.unit_ids) {
+                            in_refs.push_back(json::Value(std::to_string(unit_id)));
+                        }
+                        for (const std::string& name : scene_result.applied_names) {
+                            out_refs.push_back(json::Value(name));
+                        }
+                        MemoryDb::GenerationLog gen;
+                        gen.generation_id = scene_gen;
+                        gen.kind = "scene";
+                        gen.status = scene_result.error.empty() ? "succeeded" : "failed";
+                        gen.model_id = model_id;
+                        gen.prompt_id = kMemoryScenesPromptId;
+                        gen.prompt_sha256 = memory_scenes_prompt_sha256();
+                        gen.input_refs = json::stringify(json::Value(std::move(in_refs)));
+                        gen.output_refs = json::stringify(json::Value(std::move(out_refs)));
+                        gen.latency_ms = scene_ms;
+                        gen.error = scene_result.error;
+                        std::string log_error;
+                        if (db->insert_generation(gen, log_error) <= 0) {
+                            log::warn("memory generations: log insert failed: " + log_error);
+                        }
+                        log::info("memory: scene refresh (trigger " + trigger +
+                                  ", new units " + std::to_string(scene_result.new_units) +
+                                  ", created " + std::to_string(scene_result.created) +
+                                  ", updated " + std::to_string(scene_result.updated) +
+                                  ", merged " + std::to_string(scene_result.merged) +
+                                  ", dropped " + std::to_string(scene_result.dropped) +
+                                  ", " + std::to_string(scene_ms) + "ms)"
+                                  + (scene_result.error.empty() ? "" : ": " + scene_result.error));
+                        for (const std::string& line : scene_result.lines) {
+                            log::info("memory: scenes: " + line);
+                        }
+                        if (scene_result.changed) {
+                            publish(store_->append_event(
+                                "", "", "", "memory.scenes_updated",
+                                {{"trigger", trigger},
+                                 {"created", std::to_string(scene_result.created)},
+                                 {"updated", std::to_string(scene_result.updated)},
+                                 {"merged", std::to_string(scene_result.merged)}}));
+                        }
+                        // Persona: rewrite when the scenes changed, or on
+                        // first run (scenes exist, no persona yet).
+                        std::string perr;
+                        const bool has_persona = db->persona(perr).has_value();
+                        if (scene_result.changed || !has_persona) {
+                            const auto persona_start = std::chrono::steady_clock::now();
+                            const long long persona_ts =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            const std::string persona_gen = "gen:persona:" + std::to_string(persona_ts);
+                            memory::custom::PersonaRefreshResult persona_result =
+                                memory::custom::refresh_persona(
+                                    *db,
+                                    [this](const std::string& prompt) {
+                                        return run_memory_persona(prompt);
+                                    },
+                                    persona_gen, perr);
+                            const long long persona_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - persona_start)
+                                    .count();
+                            if (persona_result.ran) {
+                                json::Array in_refs;
+                                for (const std::string& name : persona_result.scene_names) {
+                                    in_refs.push_back(json::Value(name));
+                                }
+                                MemoryDb::GenerationLog gen;
+                                gen.generation_id = persona_gen;
+                                gen.kind = "persona";
+                                gen.status = persona_result.error.empty() ? "succeeded" : "failed";
+                                gen.model_id = model_id;
+                                gen.prompt_id = kMemoryPersonaPromptId;
+                                gen.prompt_sha256 = memory_persona_prompt_sha256();
+                                gen.input_refs = json::stringify(json::Value(std::move(in_refs)));
+                                gen.latency_ms = persona_ms;
+                                gen.error = persona_result.error;
+                                std::string log_error;
+                                if (db->insert_generation(gen, log_error) <= 0) {
+                                    log::warn("memory generations: log insert failed: " + log_error);
+                                }
+                                log::info("memory: persona refresh (" +
+                                          std::to_string(persona_result.scene_names.size()) +
+                                          " scenes, changed " +
+                                          (persona_result.changed ? "yes" : "no") +
+                                          ", " + std::to_string(persona_ms) + "ms)"
+                                          + (persona_result.error.empty() ? "" : ": " + persona_result.error));
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    log::warn(std::string("memory: scene/persona refresh failed (best-effort): ") + e.what());
+                }
                 completed++;
             } else {
                 defer_failure(job, err);
@@ -1170,6 +1662,118 @@ http::Response Daemon::memory_journey_get(const http::Request& request)
         out["created_at"] = json::Value(journey->created_at);
         out["updated_at"] = json::Value(journey->updated_at);
         response.body = json::stringify(out);
+        return response;
+    }
+
+http::Response Daemon::memory_generations_get(const http::Request& request)
+{
+        http::Response response;
+        response.headers["content-type"] = "application/json";
+        if (!authorized(bearer_token(request))) {
+            response.status = 401;
+            response.reason = "Unauthorized";
+            response.body = "{\"error\":\"unauthorized\"}";
+            return response;
+        }
+        auto param = [&](const char* key) {
+            const std::string k = std::string(key) + "=";
+            const std::size_t marker = request.query.find(k);
+            if (marker == std::string::npos) return std::string();
+            std::string value = request.query.substr(marker + k.size());
+            const std::size_t amp = value.find('&');
+            if (amp != std::string::npos) value = value.substr(0, amp);
+            return value;
+        };
+        const std::string kind = param("kind");
+        const std::string status = param("status");
+        int limit = 50;
+        if (!param("limit").empty()) {
+            try {
+                limit = std::stoi(param("limit"));
+            } catch (...) {
+                return unit_error(400, "Bad Request", "limit must be an integer");
+            }
+        }
+        std::string error;
+        MemoryDb* db = custom_db_or_null(error);
+        if (!db) {
+            return unit_error(503, "Service Unavailable",
+                              error.empty() ? "memory provider not ready" : error);
+        }
+        const std::vector<MemoryDb::GenerationLog> rows =
+            db->generations(kind, status, limit, error);
+        if (!error.empty()) return unit_error(500, "Internal Server Error", error);
+        json::Array out;
+        for (const MemoryDb::GenerationLog& g : rows) {
+            json::Object row;
+            row["id"] = json::Value(g.id);
+            row["generation_id"] = json::Value(g.generation_id);
+            row["kind"] = json::Value(g.kind);
+            row["status"] = json::Value(g.status);
+            row["model_id"] = json::Value(g.model_id);
+            row["prompt_id"] = json::Value(g.prompt_id);
+            row["prompt_sha256"] = json::Value(g.prompt_sha256);
+            row["input_refs"] = json::Value(g.input_refs);
+            row["output_refs"] = json::Value(g.output_refs);
+            row["session_id"] = json::Value(g.session_id);
+            row["latency_ms"] = json::Value(g.latency_ms);
+            row["error"] = json::Value(g.error);
+            row["created_at"] = json::Value(g.created_at);
+            out.push_back(json::Value(std::move(row)));
+        }
+        json::Object envelope;
+        envelope["generations"] = json::Value(std::move(out));
+        envelope["count"] = json::Value(static_cast<long long>(rows.size()));
+        response.body = json::stringify(envelope);
+        return response;
+    }
+
+http::Response Daemon::memory_scenes_get(const http::Request& request)
+{
+        http::Response response;
+        response.headers["content-type"] = "application/json";
+        if (!authorized(bearer_token(request))) {
+            response.status = 401;
+            response.reason = "Unauthorized";
+            response.body = "{\"error\":\"unauthorized\"}";
+            return response;
+        }
+        const bool full =
+            request.query.find("full=1") != std::string::npos;
+        std::string error;
+        MemoryDb* db = custom_db_or_null(error);
+        if (!db) {
+            return unit_error(503, "Service Unavailable",
+                              error.empty() ? "memory provider not ready" : error);
+        }
+        const std::vector<MemoryDb::SceneRow> scenes = db->scenes(error);
+        if (!error.empty()) return unit_error(500, "Internal Server Error", error);
+        json::Array out;
+        for (const MemoryDb::SceneRow& scene : scenes) {
+            json::Object row;
+            row["id"] = json::Value(scene.id);
+            row["name"] = json::Value(scene.name);
+            row["summary"] = json::Value(scene.summary);
+            row["heat"] = json::Value(static_cast<long long>(scene.heat));
+            if (full) row["content"] = json::Value(scene.content);
+            row["created_at"] = json::Value(scene.created_at);
+            row["updated_at"] = json::Value(scene.updated_at);
+            row["generation_id"] = json::Value(scene.generation_id);
+            out.push_back(json::Value(std::move(row)));
+        }
+        json::Object envelope;
+        envelope["scenes"] = json::Value(std::move(out));
+        envelope["count"] = json::Value(static_cast<long long>(scenes.size()));
+        const std::optional<MemoryDb::PersonaRow> persona = db->persona(error);
+        if (!error.empty()) return unit_error(500, "Internal Server Error", error);
+        if (persona) {
+            json::Object p;
+            p["content"] = json::Value(persona->content);
+            p["generated_at"] = json::Value(persona->generated_at);
+            p["generation_id"] = json::Value(persona->generation_id);
+            envelope["persona"] = json::Value(std::move(p));
+        }
+        response.body = json::stringify(envelope);
         return response;
     }
 
@@ -2483,6 +3087,10 @@ void Daemon::install(http::Server& server)
                     [this](const http::Request& req) {
                         return memory_journey_update(req);
                     });
+        server.get("/api/v1/memory/generations",
+                   [this](const http::Request& req) {
+                       return memory_generations_get(req);
+                   });
         server.get("/api/v1/memory/consolidations",
                    [this](const http::Request& req) { return list_consolidations(req); });
         server.post("/api/v1/memory/consolidations/{id}/approve",
@@ -2493,6 +3101,10 @@ void Daemon::install(http::Server& server)
                     [this](const http::Request& req) {
                         return decide_consolidation_route(req, false);
                     });
+        server.get("/api/v1/memory/scenes",
+                   [this](const http::Request& req) {
+                       return memory_scenes_get(req);
+                   });
         server.get("/api/v1/models",
                    [this](const http::Request& req) { return list_models(req); });
         server.post("/api/v1/profiles",
@@ -3455,6 +4067,8 @@ http::Response Daemon::migrate_memory(const http::Request& request)
         const int fetched = static_cast<int>(units.size());
         int valid = 0, stored = 0, duplicate = 0, invalid = 0, skipped = 0;
         int offset_skipped = 0;
+        const auto import_started = std::chrono::steady_clock::now();
+        std::vector<long long> imported_ids;
         for (const memory::MemoryUnit& unit : units) {
             if (max_units > 0 && valid >= max_units) break;
             if (unit.state != "valid") { ++skipped; continue; }
@@ -3462,11 +4076,9 @@ http::Response Daemon::migrate_memory(const http::Request& request)
             ++valid;
             // Map the Hindsight fact_type onto the local valid type set; fall
             // back to "observation" for anything unrecognized.
-            std::string type = unit.fact_type;
-            if (type != "world" && type != "experience" && type != "observation" &&
-                type != "mental_model" && type != "procedure" && type != "lesson") {
-                type = "observation";
-            }
+            const std::string type = memory::custom::valid_type(unit.fact_type)
+                                         ? unit.fact_type
+                                         : std::string("observation");
             memory::custom::RetainSpec spec;
             spec.direct_text = unit.text;
             spec.direct_type = type;
@@ -3481,6 +4093,38 @@ http::Response Daemon::migrate_memory(const http::Request& request)
             stored += result.stored;
             duplicate += result.duplicate;
             invalid += result.invalid;
+            for (const long long id : result.unit_ids) imported_ids.push_back(id);
+        }
+
+        // Provenance: one best-effort log row per import batch (the ref is
+        // bank + batch time, so re-imports log fresh rows).
+        if (fetched > 0) {
+            MemoryDb::GenerationLog gen;
+            const long long batch_ts =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            gen.generation_id = "gen:import:hindsight:" + mc.bank_id + ":" +
+                                std::to_string(batch_ts);
+            gen.kind = "import";
+            gen.status = "succeeded";
+            gen.model_id = "import:hindsight";
+            json::Array inputs;
+            inputs.push_back(json::Value("hindsight:" + mc.bank_id));
+            gen.input_refs = json::stringify(json::Value(std::move(inputs)));
+            json::Array outputs;
+            for (const long long id : imported_ids) {
+                outputs.push_back(json::Value(id));
+            }
+            gen.output_refs = json::stringify(json::Value(std::move(outputs)));
+            gen.latency_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - import_started)
+                    .count();
+            std::string log_error;
+            if (db->insert_generation(gen, log_error) <= 0) {
+                log::warn("memory generations: log insert failed: " + log_error);
+            }
         }
 
         log::info("memory: migrated from Hindsight bank " + mc.bank_id +
@@ -3648,6 +4292,7 @@ Daemon::MemoryRecallOutcome Daemon::memory_recall_core(const std::string& query,
                     req.budget_tokens = static_cast<int>(max_tokens);
                 }
                 req.suppressed = suppressed;
+                req.deadline_ms = static_cast<int>(timeout_ms);
                 {
                     std::lock_guard<std::mutex> lock(config_mutex_);
                     req.rerank_top = static_cast<int>(config_.memory_rerank_top);
@@ -3658,6 +4303,13 @@ Daemon::MemoryRecallOutcome Daemon::memory_recall_core(const std::string& query,
                 if (result.ok) {
                     outcome.source = "custom";
                     outcome.suppressed_below_floor = result.suppressed_below_floor;
+                    outcome.timed_out = result.timed_out;
+                    outcome.budget_dropped = result.budget_dropped;
+                    outcome.truncated = result.truncated;
+                    if (result.timed_out) {
+                        log::warn("memory: custom recall timed out (" +
+                                   result.error + ")");
+                    }
                     for (const memory::custom::RecallHit& hit : result.hits) {
                         json::Object item;
                         item["id"] =
@@ -3745,15 +4397,27 @@ http::Response Daemon::memory_recall(const http::Request& request)
         long long max_tokens = body["max_tokens"].as_integer(0);
         if (max_tokens < 0) max_tokens = 0;
         if (max_tokens > 8000) max_tokens = 8000;
+        // Structured timeout: on expiry the custom path returns partial
+        // results (timed_out) instead of failing the request.
+        long long timeout_ms = body["timeout_ms"].as_integer(15000);
+        if (timeout_ms < 1) timeout_ms = 1;
+        if (timeout_ms > 30000) timeout_ms = 30000;
 
         const MemoryRecallOutcome outcome =
-            memory_recall_core(query, session_id, profile, max_tokens, 15000);
+            memory_recall_core(query, session_id, profile, max_tokens, timeout_ms);
         json::Object out;
         out["source"] = json::Value(outcome.source);
         if (outcome.fallback) out["fallback"] = json::Value(true);
         if (outcome.suppressed_below_floor > 0) {
             out["suppressed_below_floor"] =
                 json::Value(outcome.suppressed_below_floor);
+        }
+        if (outcome.timed_out) out["timed_out"] = json::Value(true);
+        if (outcome.budget_dropped > 0) {
+            out["budget_dropped"] = json::Value(outcome.budget_dropped);
+        }
+        if (outcome.truncated > 0) {
+            out["truncated"] = json::Value(outcome.truncated);
         }
         out["query"] = json::Value(query);
         out["results"] = json::Value(outcome.results);
@@ -4060,7 +4724,17 @@ std::string Daemon::core_memory_block(std::string& error)
             error = err;
             return "";
         }
-        if (units.empty()) return "";
+        // L3 persona: the model-distilled user core, ahead of the operator's
+        // pinned units (both are stable tier, both under the same budget).
+        std::string persona;
+        const std::optional<MemoryDb::PersonaRow> current_persona =
+            db->persona(err);
+        if (!err.empty()) {
+            error = err;
+            return "";
+        }
+        if (current_persona) persona = current_persona->content;
+        if (persona.empty() && units.empty()) return "";
         std::vector<long long> version_ids;
         version_ids.reserve(units.size());
         for (const MemoryDb::UnitRow& unit : units) {
@@ -4077,22 +4751,29 @@ std::string Daemon::core_memory_block(std::string& error)
             by_version[version.id] = &version;
         }
         static constexpr std::size_t kMaxCoreBytes = 8192;
-        std::string block = "[CORE MEMORY]\n"
-                            "Pinned core facts. They are always in context; "
-                            "do not re-ask the user about them.\n";
-        std::size_t included = 0;
-        for (const MemoryDb::UnitRow& unit : units) {
-            const auto it = by_version.find(unit.current_version_id);
-            if (it == by_version.end() || it->second->text.empty()) continue;
-            const std::string& text = it->second->text;
-            if (block.size() + text.size() + 4 > kMaxCoreBytes) {
-                error = "core memory budget exceeded; remaining pinned units omitted";
-                break;
-            }
-            block += "- " + text + "\n";
-            ++included;
+        std::string block = "[CORE MEMORY]\n";
+        if (!persona.empty()) {
+            block += "User persona (distilled from the memory bank; do not "
+                     "re-ask the user about it):\n"
+                     + persona + "\n\n";
         }
-        if (included == 0) return "";
+        std::size_t included = 0;
+        if (!units.empty()) {
+            block += "Pinned core facts. They are always in context; "
+                     "do not re-ask the user about them.\n";
+            for (const MemoryDb::UnitRow& unit : units) {
+                const auto it = by_version.find(unit.current_version_id);
+                if (it == by_version.end() || it->second->text.empty()) continue;
+                const std::string& text = it->second->text;
+                if (block.size() + text.size() + 4 > kMaxCoreBytes) {
+                    error = "core memory budget exceeded; remaining pinned units omitted";
+                    break;
+                }
+                block += "- " + text + "\n";
+                ++included;
+            }
+        }
+        if (persona.empty() && included == 0) return "";
         return block;
     }
 
@@ -4241,6 +4922,8 @@ http::Response Daemon::memory_unit_detail(const http::Request& request)
             vobj["id"] = json::Value(std::to_string(v.id));
             vobj["text"] = json::Value(v.text);
             vobj["model_id"] = json::Value(v.model_id);
+            vobj["prompt_revision"] = json::Value(v.prompt_revision);
+            vobj["generation_id"] = json::Value(v.generation_id);
             vobj["store_reason"] = json::Value(v.store_reason);
             vobj["created_at"] = json::Value(v.created_at);
             vobj["current"] = json::Value(v.id == unit.current_version_id);
@@ -9967,6 +10650,12 @@ std::string Daemon::run_terminal(const std::string& unix_shell, const std::strin
                             return retry_out;
                         };
                         if (!grant_covered) {
+                            // Only one sudo gate at a time: the run carries a
+                            // single pending-call slot, so a concurrent wave
+                            // call waits its turn here instead of clobbering
+                            // the gate's state.
+                            std::unique_lock<std::mutex> sudo_lock(
+                                run->sudo_gate_mutex);
                             // No valid grant: park on the password gate. The
                             // question shows the command so the operator
                             // decides with context; the answer carries the
@@ -10191,6 +10880,12 @@ const std::vector<Daemon::ToolSpec>& Daemon::tool_manifest(bool memory_available
         static const ToolParam kMemorySave[] = {{
             "text",
             "The fact to remember, written as one self-contained sentence.",
+        }, {
+            "?type",
+            "Optional category: world (stable user/environment fact), "
+            "experience (event or decision), observation (may change), "
+            "mental_model (how the user thinks), procedure (how-to), "
+            "lesson (pitfall). Default: experience.",
         }};
         static const ToolParam kMemoryUse[] = {{
             "ids",
@@ -10479,9 +11174,11 @@ const std::vector<Daemon::ToolSpec>& Daemon::tool_manifest(bool memory_available
                 "memory.save",
                 "Store one durable fact in the long-term memory bank. Use for "
                 "decisions, preferences, constraints, and context that should "
-                "persist across sessions. One self-contained fact per call.",
+                "persist across sessions. One self-contained fact per call. "
+                "Set type to match the fact's category (default experience; "
+                "stable user/environment facts are world).",
                 kMemorySave,
-                1,
+                2,
                 true,
             },
             {
@@ -10758,6 +11455,20 @@ std::string Daemon::memory_recall_tool(const std::string& query, const std::stri
                    item["id"].as_string() + ")\n" + text + "\n";
         }
         if (count == 0) return "No memories matched: " + trimmed;
+        if (outcome.timed_out || outcome.budget_dropped > 0 ||
+            outcome.truncated > 0) {
+            out += "(partial recall: ";
+            if (outcome.timed_out) out += "timed out, ";
+            if (outcome.budget_dropped > 0) {
+                out += std::to_string(outcome.budget_dropped) +
+                       " dropped by the token budget, ";
+            }
+            if (outcome.truncated > 0) {
+                out += std::to_string(outcome.truncated) +
+                       " truncated to the per-item cap, ";
+            }
+            out += "longer memories may be cut mid-sentence)";
+        }
         // Feedback: these memories were offered to the model this turn.
         record_offered_from_outcome(outcome, run_id);
         return out;
@@ -11046,7 +11757,7 @@ std::string Daemon::memory_act_tool(const std::string& ids, const std::string& r
                (marked == 1 ? " memory." : " memories.");
     }
 
-std::string Daemon::memory_save_tool(const std::string& text, const std::string& sid, const std::string& profile_id)
+std::string Daemon::memory_save_tool(const std::string& text, const std::string& type, const std::string& sid, const std::string& profile_id)
 {
         const std::string trimmed = trim_ascii(text);
         if (trimmed.empty()) {
@@ -11070,15 +11781,50 @@ std::string Daemon::memory_save_tool(const std::string& text, const std::string&
                    (error.empty() ? std::string("not configured") : error) +
                    ").";
         }
+        // Unknown/omitted type falls back to experience (the retain path
+        // would reject the candidate outright otherwise).
+        const std::string unit_type =
+            memory::custom::valid_type(type) ? type : std::string("experience");
         memory::custom::RetainSpec spec;
         spec.direct_text = trimmed;
-        spec.direct_type = "experience";
+        spec.direct_type = unit_type;
         spec.session_id = sid;
         spec.profile = profile_id;
         spec.model_id = "agent";
+        // Stable ref: the content hash, so a re-save of the same text maps
+        // to the same log row (INSERT OR IGNORE dedupes it).
+        spec.generation_id = "gen:direct:" + sha256_hex(trimmed);
+        const auto save_started = std::chrono::steady_clock::now();
         memory::custom::RetainResult result;
         std::string err;
         result = memory::custom::retain(*db, *embed, spec, nullptr, err);
+        // Provenance: best-effort log row for this direct save (a log
+        // failure never changes the save result).
+        {
+            MemoryDb::GenerationLog gen;
+            gen.generation_id = spec.generation_id;
+            gen.kind = "direct";
+            gen.status = err.empty() ? "succeeded" : "failed";
+            gen.model_id = "agent";
+            if (!sid.empty()) {
+                json::Array inputs;
+                inputs.push_back(json::Value(sid));
+                gen.input_refs = json::stringify(json::Value(std::move(inputs)));
+            }
+            json::Array outputs;
+            for (const long long id : result.unit_ids) outputs.push_back(json::Value(id));
+            gen.output_refs = json::stringify(json::Value(std::move(outputs)));
+            gen.session_id = sid;
+            gen.latency_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - save_started)
+                    .count();
+            gen.error = err;
+            std::string log_error;
+            if (db->insert_generation(gen, log_error) <= 0) {
+                log::warn("memory generations: log insert failed: " + log_error);
+            }
+        }
         if (!err.empty()) {
             return "Error: memory.save failed: " + err;
         }
@@ -12775,7 +13521,7 @@ std::string Daemon::dispatch_tool(const std::string& name, const std::string& ar
             return spill_read_tool(param("id"), param("offset"),
                                    param("limit"), sid);
         }
-        return memory_save_tool(param("text"), sid, profile_id);
+        return memory_save_tool(param("text"), param("type"), sid, profile_id);
     }
 
 void Daemon::withdraw_queued_user_message(const std::shared_ptr<Daemon::Run>& run, const std::shared_ptr<Daemon::Session>& session)
@@ -14560,11 +15306,187 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
             int suppressed_in_batch = 0;
             int inert_suppressed = 0;
 
+            // Parallel tool waves: consecutive same-group calls in a batch
+            // run concurrently on a small spawn/join thread pool, and
+            // results stay in call order.
+            // Groups: Read (read-only manifest tools and read-only-argv
+            // terminal calls), Run (other terminal calls), Exclusive (input
+            // tools, memory.save, and anything that parked the run at a
+            // gate). The only cross-thread state is the work counter and the
+            // pre-sized result slots; ledger ordering comes from the store's
+            // mutex (sequence numbers) and SSE frame integrity from the
+            // process-wide write lock. Cancellation mid-wave fills the
+            // remaining calls with synthetic results.
+            static constexpr std::size_t kMaxWaveThreads = 4;
+            enum class ToolWaveGroup { Read, Run, Exclusive };
+            std::vector<std::string> call_ids(tool_names.size());
+            std::vector<bool> guard_reminders(tool_names.size(), false);
             for (std::size_t index = 0; index < tool_names.size(); ++index) {
-                if (run->cancel_flag->load()) break;
-                const std::string call_id =
+                call_ids[index] =
                     tool_call_ids[index].empty() ? "tool-" + std::to_string(index)
                                                  : tool_call_ids[index];
+            }
+            const auto wave_group_for =
+                [&](std::size_t index) -> ToolWaveGroup {
+                    const std::string& name = tool_names[index];
+                    if (is_input_tool(name)) return ToolWaveGroup::Exclusive;
+                    if (name == "terminal") {
+                        return is_terminal_read_only_call(name,
+                                                          tool_arguments[index])
+                            ? ToolWaveGroup::Read
+                            : ToolWaveGroup::Run;
+                    }
+                    // memory.save is manifest "read-only" (no approval gate)
+                    // but persists to the memory bank: keep it serialized.
+                    if (name == "memory.save") return ToolWaveGroup::Exclusive;
+                    return ToolWaveGroup::Read;
+                };
+            const auto emit_tool_started = [&](std::size_t index) {
+                publish(store_->append_event(sid, rid, "", "tool.started",
+                    {{"tool_id", call_ids[index]},
+                     {"name", tool_names[index]},
+                     {"arguments", tool_arguments[index]}}));
+            };
+            // The tool body itself: runs on the wave's worker threads or on
+            // the run thread (inline calls). Returns the result text and the
+            // wall-clock duration the web's tool rows display.
+            const auto run_tool_body =
+                [&](std::size_t index) -> std::pair<std::string, long long> {
+                    const auto started_at = std::chrono::steady_clock::now();
+                    std::string result_text = dispatch_tool(
+                        tool_names[index], tool_arguments[index], sid,
+                        profile_id, rid, CancellationToken(run->cancel_flag));
+                    const long long duration_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started_at)
+                            .count();
+                    return {std::move(result_text), duration_ms};
+                };
+            // Post-body bookkeeping: md-log for input tools, the loop guard
+            // reminder note, the runaway observation, tool.completed. Runs on
+            // the run thread in call order (single-threaded), so the
+            // turn-local runaway guard needs no locking.
+            const auto finish_tool =
+                [&](std::size_t index, std::string& result_text,
+                    long long duration_ms, bool guard_reminder) {
+                    if (is_input_tool(tool_names[index])) {
+                        const std::string kind = tool_names[index] == "quiz"
+                            ? (result_text.rfind("Correct.", 0) == 0
+                                   ? "success"
+                                   : result_text.rfind("Incorrect.", 0) == 0
+                                         ? "failure"
+                                         : "note")
+                            : "note";
+                        md_log_append(sid, md_log_callout(kind, result_text));
+                    }
+                    if (guard_reminder) {
+                        // 2nd identical call: the result runs normally, with
+                        // the change-approach note appended (the model sees
+                        // it in the tool message; the ledger carries it in
+                        // the result).
+                        result_text += "\n\n";
+                        result_text += loopguard::kRepeatNote;
+                        publish(store_->append_event(
+                            sid, rid, "", "loop.guard",
+                            {{"stage", "reminder"},
+                             {"tool", tool_names[index]},
+                             {"args", tool_arguments[index]},
+                             {"inert", "false"},
+                             {"text", loopguard::kRepeatNote}}));
+                    }
+                    // Runaway observation: executed calls only (a suppressed
+                    // call never reaches here - the Guard owns that storm).
+                    // Input tools are exempt: the question is the decision.
+                    if (!is_input_tool(tool_names[index])) {
+                        const auto runaway = runaway_guard.observe(
+                            tool_names[index], tool_arguments[index],
+                            result_text);
+                        if (runaway.kind != loopguard::RunawayKind::None) {
+                            const std::string note =
+                                loopguard::runaway_note(runaway.kind);
+                            result_text += "\n\n";
+                            result_text += note;
+                            publish(store_->append_event(
+                                sid, rid, "", "loop.guard",
+                                {{"stage", "reminder"},
+                                 {"tool", tool_names[index]},
+                                 {"args", tool_arguments[index]},
+                                 {"kind", loopguard::kind_name(runaway.kind)},
+                                 {"detail", runaway.detail},
+                                 {"inert", "false"},
+                                 {"text", note}}));
+                        }
+                    }
+                    publish(store_->append_event(sid, rid, "", "tool.completed",
+                        {{"tool_id", call_ids[index]},
+                         {"name", tool_names[index]},
+                         {"duration_ms", std::to_string(duration_ms)},
+                         {"result", result_text}}));
+                };
+            ToolWaveGroup open_wave_group = ToolWaveGroup::Exclusive;
+            std::vector<std::size_t> open_wave;
+            const auto flush_wave = [&]() {
+                if (open_wave.empty()) return;
+                if (open_wave.size() == 1) {
+                    const std::size_t index = open_wave[0];
+                    emit_tool_started(index);
+                    auto [result_text, duration_ms] = run_tool_body(index);
+                    finish_tool(index, result_text, duration_ms,
+                                guard_reminders[index]);
+                    executed_ids.push_back(call_ids[index]);
+                    executed_results.push_back(std::move(result_text));
+                } else {
+                    for (const std::size_t index : open_wave) {
+                        emit_tool_started(index);
+                    }
+                    std::vector<std::string> results(open_wave.size());
+                    std::vector<long long> durations(open_wave.size(), 0);
+                    std::atomic<std::size_t> next{0};
+                    const std::size_t threads =
+                        std::min(open_wave.size(), kMaxWaveThreads);
+                    std::vector<std::thread> pool;
+                    pool.reserve(threads);
+                    for (std::size_t worker = 0; worker < threads; ++worker) {
+                        pool.emplace_back([&]() {
+                            for (;;) {
+                                const std::size_t slot = next.fetch_add(
+                                    1, std::memory_order_relaxed);
+                                if (slot >= open_wave.size()) break;
+                                const std::size_t index = open_wave[slot];
+                                if (run->cancel_flag->load()) {
+                                    results[slot] =
+                                        "Cancelled: the run was stopped "
+                                        "before this call started.";
+                                    continue;
+                                }
+                                auto [result_text, duration_ms] =
+                                    run_tool_body(index);
+                                results[slot] = std::move(result_text);
+                                durations[slot] = duration_ms;
+                            }
+                        });
+                    }
+                    for (auto& worker_thread : pool) worker_thread.join();
+                    for (std::size_t slot = 0; slot < open_wave.size();
+                         ++slot) {
+                        const std::size_t index = open_wave[slot];
+                        finish_tool(index, results[slot], durations[slot],
+                                    guard_reminders[index]);
+                        executed_ids.push_back(call_ids[index]);
+                        executed_results.push_back(std::move(results[slot]));
+                    }
+                }
+                open_wave.clear();
+            };
+
+            for (std::size_t index = 0; index < tool_names.size(); ++index) {
+                if (run->cancel_flag->load()) {
+                    // Close the queued wave with synthetic results so its
+                    // ledger rows do not strand in "running".
+                    flush_wave();
+                    break;
+                }
+                const std::string call_id = call_ids[index];
                 ++calls_in_batch;
 
                 // Loop guard (pre-dispatch, docs/loop-guards.md): repeated
@@ -14591,6 +15513,7 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                         guard_reminder = true;
                     }
                 }
+                guard_reminders[index] = guard_reminder;
                 if (guard_suppress) {
                     const std::string guard_text =
                         guard_inert ? loopguard::inert_guard_text()
@@ -14881,6 +15804,7 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                 }
 
                 if (run->cancel_flag->load()) {
+                    flush_wave();
                     run->status = RunStatus::Cancelled;
                     log::info("run cancelled " + rid + " session=" + sid + " (cancel)");
                     persist_partial_assistant(run, sid, rid, assistant_text, reasoning_text,
@@ -14975,6 +15899,7 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                     // model is spinning on a tool the operator will not allow.
                     // Hard-stop with an actionable error instead of a storm.
                     if (consecutive_denials >= kMaxConsecutiveDenials) {
+                        flush_wave();
                         run->status = RunStatus::Failed;
                         log::warn("run failed " + rid + " session=" + sid +
                                   ": denial circuit breaker (" +
@@ -14990,6 +15915,8 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                         publish(store_->append_event(sid, rid, "", "run.failed", payload));
                         return;
                     }
+                    executed_ids.push_back(call_id);
+                    executed_results.push_back(std::move(result_text));
                 } else {
                     consecutive_denials = 0;
                     run->status = RunStatus::Running;
@@ -15061,79 +15988,30 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                                                 {{"input_id", call_id},
                                                  {"choice", std::to_string(choice)}}));
                     }
-                    publish(store_->append_event(sid, rid, "", "tool.started",
-                                            {{"tool_id", call_id},
-                                             {"name", tool_names[index]},
-                                             {"arguments", tool_arguments[index]}}));
-                    // The wall-clock measurement the web's tool rows display:
-                    // a running row ticks live from tool.started, and this
-                    // payload freezes the total on tool.completed.
-                    const auto tool_started_at = std::chrono::steady_clock::now();
-                    result_text = dispatch_tool(
-                        tool_names[index], tool_arguments[index], sid, profile_id,
-                        rid, CancellationToken(run->cancel_flag));
-                    const long long tool_duration_ms =
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - tool_started_at)
-                            .count();
-                    if (is_input_tool(tool_names[index])) {
-                        const std::string kind = tool_names[index] == "quiz"
-                            ? (result_text.rfind("Correct.", 0) == 0
-                                   ? "success"
-                                   : result_text.rfind("Incorrect.", 0) == 0
-                                         ? "failure"
-                                         : "note")
-                            : "note";
-                        md_log_append(sid, md_log_callout(kind, result_text));
-                    }
-                    if (guard_reminder) {
-                        // 2nd identical call: the result runs normally, with
-                        // the change-approach note appended (the model sees
-                        // it in the tool message; the ledger carries it in
-                        // the result).
-                        result_text += "\n\n";
-                        result_text += loopguard::kRepeatNote;
-                        publish(store_->append_event(
-                            sid, rid, "", "loop.guard",
-                            {{"stage", "reminder"},
-                             {"tool", tool_names[index]},
-                             {"args", tool_arguments[index]},
-                             {"inert", "false"},
-                             {"text", loopguard::kRepeatNote}}));
-                    }
-                    // Runaway observation: executed calls only (a suppressed
-                    // call never reaches here - the Guard owns that storm).
-                    // Input tools are exempt: the question is the decision.
-                    if (!is_input_tool(tool_names[index])) {
-                        const auto runaway = runaway_guard.observe(
-                            tool_names[index], tool_arguments[index],
-                            result_text);
-                        if (runaway.kind != loopguard::RunawayKind::None) {
-                            const std::string note =
-                                loopguard::runaway_note(runaway.kind);
-                            result_text += "\n\n";
-                            result_text += note;
-                            publish(store_->append_event(
-                                sid, rid, "", "loop.guard",
-                                {{"stage", "reminder"},
-                                 {"tool", tool_names[index]},
-                                 {"args", tool_arguments[index]},
-                                 {"kind", loopguard::kind_name(runaway.kind)},
-                                 {"detail", runaway.detail},
-                                 {"inert", "false"},
-                                 {"text", note}}));
+                    // Wave dispatch: exclusive calls (input tools,
+                    // memory.save, anything that parked the run at a gate)
+                    // run inline at this position; consecutive same-group
+                    // calls accumulate into a wave that runs on the pool.
+                    const ToolWaveGroup group = wave_group_for(index);
+                    if (group == ToolWaveGroup::Exclusive) {
+                        flush_wave();
+                        emit_tool_started(index);
+                        auto [body_result, body_duration] =
+                            run_tool_body(index);
+                        finish_tool(index, body_result, body_duration,
+                                    guard_reminder);
+                        executed_ids.push_back(call_id);
+                        executed_results.push_back(std::move(body_result));
+                    } else {
+                        if (open_wave.empty() || open_wave_group != group) {
+                            flush_wave();
+                            open_wave_group = group;
                         }
+                        open_wave.push_back(index);
                     }
-                    publish(store_->append_event(sid, rid, "", "tool.completed",
-                                            {{"tool_id", call_id},
-                                             {"name", tool_names[index]},
-                                             {"duration_ms", std::to_string(tool_duration_ms)},
-                                             {"result", result_text}}));
                 }
-
-                executed_ids.push_back(call_id);
-                executed_results.push_back(std::move(result_text));
             }
+            flush_wave();
             tools_ran_in_run += static_cast<int>(executed_ids.size());
 
             if (!executed_ids.empty()) {
@@ -15572,13 +16450,13 @@ void Daemon::enqueue_approved_record_retain(const MemoryRecord& record, long lon
             provider_name = config_.memory_provider;
         }
         if (!enabled || record.text.empty()) return;
-        // Map the record's type onto the unit vocabulary (default "fact" →
-        // world); recognized unit types pass through unchanged.
+        // Map the record's type onto the unit vocabulary: recognized unit
+        // types pass through unchanged, "decision" is an event (experience),
+        // and everything else (fact, preference, ...) is a stable user/world
+        // fact.
         std::string unit_type = record.type;
-        if (unit_type != "world" && unit_type != "experience" &&
-            unit_type != "observation" && unit_type != "mental_model" &&
-            unit_type != "procedure" && unit_type != "lesson") {
-            unit_type = "world";
+        if (!memory::custom::valid_type(unit_type)) {
+            unit_type = record.type == "decision" ? "experience" : "world";
         }
         // Only a session-scoped record keeps its session binding; the others
         // promote to the global pool.
@@ -15603,6 +16481,10 @@ void Daemon::enqueue_approved_record_retain(const MemoryRecord& record, long lon
         if (provider_name == "custom") {
             payload["direct_text"] = json::Value(record.text);
             payload["direct_type"] = json::Value(unit_type);
+            // Provenance: the worker logs this retain (kind is derived from
+            // the document_id prefix; no prompt - trusted operator text).
+            payload["generation_id"] =
+                json::Value("gen:approved:nyaxus-record:" + std::to_string(id));
         } else {
             payload["content"] = json::Value(record.text);
         }

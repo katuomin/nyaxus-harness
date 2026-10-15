@@ -52,6 +52,7 @@ class MemoryDb {
         std::string store_reason;
         std::string model_id;  // "aux:<model>" | "direct" | "import:<source>"
         std::string prompt_revision;
+        std::string generation_id;  // provenance: the memory_generations row that produced this unit
         double confidence = 0.5;
         std::string mentioned_at;  // optional ISO date (temporal lookup)
         std::string occurred_start;
@@ -83,6 +84,7 @@ class MemoryDb {
         long long id = 0;
         long long memory_id = 0;
         std::string text, content_hash, store_reason, model_id, prompt_revision;
+        std::string generation_id;  // provenance: the generation that produced this version
         long long supersedes_version_id = 0;
         std::string created_at;
     };
@@ -221,6 +223,11 @@ class MemoryDb {
     // Active units updated after `watermark` (targeted selection).
     std::vector<UnitRow> active_units_updated_since(const std::string& watermark,
                                                     std::string& error);
+    // Active units created after `since`, newest first, capped at `cap`
+    // (0 = no cap). The scene watermark query: which units the last scene
+    // refresh has not seen yet.
+    std::vector<UnitRow> active_units_created_since(const std::string& since,
+                                                    int cap, std::string& error);
     void mark_consolidated(long long unit_id, std::string& error);
 
     // ── Consolidation candidates (approval gate) ────────────────────────
@@ -274,6 +281,76 @@ class MemoryDb {
     bool upsert_journey(const std::string& session_id, const std::string& profile,
                         const std::string& text, long long watermark,
                         std::string& error);
+
+    // ── L2 scene blocks + L3 persona ───────────────────────────────────
+    // Scene blocks: topic-level narrative distillation of the L1 units
+    // (the L2 layer of the unit -> scene -> persona distillation). A derived
+    // artifact: each block is rewritten in place by the auxiliary model from
+    // the units it covers, so there is no version history - the units are the
+    // source of truth. `heat` is the
+    // integration counter (update +1, merge = sum of merged +1) and drives
+    // scene ordering and the cap-overflow merge priority.
+    struct SceneRow {
+        long long id = 0;
+        std::string name;       // unique slug (lowercase, digits, hyphens)
+        std::string summary;    // one line, for the scene map
+        int heat = 0;
+        std::string content;    // full markdown narrative
+        std::string created_at, updated_at;
+        std::string generation_id;
+    };
+    // Heat-descending (map ordering); the scene set is small by contract.
+    std::vector<SceneRow> scenes(std::string& error) const;
+    // Insert when the name is new, update content/summary/heat when it
+    // exists. Returns the scene id (0 on failure).
+    long long upsert_scene(const std::string& name, const std::string& summary,
+                           int heat, const std::string& content,
+                           const std::string& generation_id, std::string& error);
+    bool delete_scene_by_name(const std::string& name, std::string& error);
+    // Newest scene's updated_at: the scene watermark ("new units" for the
+    // next refresh are the units created after it). Empty when there are no
+    // scenes (first refresh = whole bank, capped).
+    std::string max_scene_updated_at(std::string& error) const;
+    long long scene_count(std::string& error) const;
+
+    // Persona: the L3 core document - one row, rewritten in place, injected
+    // into every prompt's stable tier. Derived from the scene set.
+    struct PersonaRow {
+        long long id = 0;
+        std::string content;
+        std::string generated_at;
+        std::string generation_id;
+    };
+    std::optional<PersonaRow> persona(std::string& error) const;
+    long long upsert_persona(const std::string& content,
+                             const std::string& generation_id, std::string& error);
+
+    // ── Generation provenance log ──────────────────────────────────────
+    // One row per memory generation (aux extraction, direct save, record
+    // approval, Hindsight import, journey rewrite): the exact prompt
+    // (id + revision + sha256), model, in/out refs, latency, and outcome.
+    // Best-effort by contract: a log failure is logged, never propagated
+    // (the generation itself has already succeeded).
+    struct GenerationLog {
+        long long id = 0;
+        std::string generation_id;  // stable: gen:<kind>:<ref>
+        std::string kind;           // extract|direct|approved|import|journey
+        std::string status;         // succeeded|failed
+        std::string model_id;
+        std::string prompt_id;
+        std::string prompt_sha256;
+        std::string input_refs;     // JSON array of strings
+        std::string output_refs;    // JSON array of strings (unit ids)
+        std::string session_id;
+        long long latency_ms = 0;
+        std::string error;
+        std::string created_at;
+    };
+    long long insert_generation(const GenerationLog& generation, std::string& error);
+    // Newest first; kind/status are equality filters (empty = all).
+    std::vector<GenerationLog> generations(const std::string& kind,
+                                           const std::string& status, int limit,
+                                           std::string& error);
     // The newest journey of another session of the same profile (the
     // [PREV SESSION] story pointer); exclude_sid is the current session.
     std::optional<JourneyRow> latest_journey_for_profile(
