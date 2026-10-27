@@ -106,6 +106,11 @@ export type HarnessEventType =
   // marks each speaker turn; and group.abstained records a speaker's
   // nothing-to-add (a tool call, not prose - the ledgered closure signal).
   | "group.created"
+  // Invite (docs/group-chat.md): a profile added to an existing conversation
+  // (a 1:1 becomes a group; a group gains a speaker). Lands immediately on
+  // the roster change - it carries the post-join roster and the joined
+  // speaker, so it precedes any group.started.
+  | "group.joined"
   | "group.started"
   | "group.turn.prepared"
   // Continue-after-error pairing: run.continued names the FAILED run a new
@@ -291,6 +296,12 @@ export interface HarnessTool {
   summary?: string;
   arguments?: string;
   result?: string;
+  // Ephemeral mid-flight progress (tool.progress): the daemon announces a
+  // long-running tool's live state. status "browsing" carries the page
+  // title/URL the web.fetch camofox tier opened plus live page frames
+  // (frame is a data URL; intermediate frames are SSE-only, the terminal
+  // frame is ledgered so the finished row keeps the final page).
+  progress?: { status: string; title?: string; url?: string; frame?: string };
 }
 
 export interface HarnessMetrics {
@@ -1116,6 +1127,9 @@ export interface HarnessClient {
   // Set a group session's round-budget override (null = clear, the global
   // group.max_rounds setting applies again). Applies from the next group run.
   setSessionGroupRounds(sessionId: string, rounds: number | null): Promise<void>;
+  // Group chat invite: append a profile to an existing conversation (a 1:1
+  // becomes a group; a group gains a speaker). Returns the post-join order.
+  addSessionSpeaker(sessionId: string, profileId: string): Promise<string[]>;
   loadSession(sessionId: string): Promise<HarnessSnapshot>;
   listProfiles(): Promise<HarnessProfile[]>;
   listModels(): Promise<{ default: string; models: string[] }>;
@@ -1317,6 +1331,7 @@ const EVENT_TYPES: HarnessEventType[] = [
   "worker.failed",
   "worker.cancelled",
   "group.created",
+  "group.joined",
   "group.started",
   "group.turn.prepared",
   "run.continued",
@@ -1458,6 +1473,19 @@ function buildRunFromEvents(events: HarnessEvent[], sessionId: string, start: Ha
           startedAt: event.emittedAt,
           ...(event.payload.arguments !== undefined ? { arguments: String(event.payload.arguments || "") } : {}),
         });
+      }
+    } else if (event.type === "tool.progress") {
+      // Ephemeral mid-flight state (e.g. the camofox tier's live page
+      // title/URL). Ledgered, so a refresh mid-fetch restores the card.
+      const id = String(event.payload.tool_id || "");
+      const tool = run.tools.find((candidate) => candidate.id === id && candidate.status === "running");
+      if (tool && event.payload.status) {
+        tool.progress = {
+          status: String(event.payload.status),
+          ...(typeof event.payload.title === "string" && event.payload.title ? { title: String(event.payload.title) } : {}),
+          ...(typeof event.payload.url === "string" && event.payload.url ? { url: String(event.payload.url) } : {}),
+          ...(typeof event.payload.frame === "string" && event.payload.frame ? { frame: String(event.payload.frame) } : {}),
+        };
       }
     } else if (event.type === "tool.completed") {
       const id = String(event.payload.tool_id || event.eventId);
@@ -1928,6 +1956,14 @@ export function groupStateFromEvents(events: HarnessEvent[]): GroupState {
         ? event.payload.speakers.filter((s): s is string => typeof s === "string")
         : [];
       if (speakers.length > 0) state = { ...state, speakers };
+    } else if (event.type === "group.joined") {
+      // Invite: the roster change lands before any group.started, so it must
+      // apply whether or not a group is active (the same rule group.created
+      // uses). The payload's speakers is the full post-join roster.
+      const speakers = Array.isArray(event.payload.speakers)
+        ? event.payload.speakers.filter((s): s is string => typeof s === "string")
+        : [];
+      if (speakers.length > 0) state = { ...state, speakers };
     } else if (event.type === "group.started") {
       const speakers = Array.isArray(event.payload.speakers)
         ? event.payload.speakers.filter((s): s is string => typeof s === "string")
@@ -2056,6 +2092,19 @@ export function parseSpawnResult(result: string): SpawnResult | null {
 // Event window for chat block reconstruction; consolidated steps leave only
 // a handful of events each, so this holds many runs' full interleaving.
 export const EVENT_WINDOW = 500;
+
+// ── bounded display history ──────────────────────────────────────────────
+// The chat mounts the latest CHAT_WINDOW_SIZE-message tail; scrolling up
+// grows the mounted window lazily, capped at HISTORY_MAX_LINES mounted
+// messages. At the cap auto-expand stops and the transcript's top strip
+// directs the reader to search / the session graph for anything older
+// (anchored jumps bypass the cap). The durable ledger and the model
+// context are never trimmed by any of this - it is display-only.
+export const HISTORY_MAX_LINES = 500;
+
+export function canLoadEarlier(windowStart: number, pathLength: number): boolean {
+  return windowStart > 0 && pathLength - windowStart < HISTORY_MAX_LINES;
+}
 // Per-run cap on live delta events kept in the window. A chatty step can
 // stream hundreds of deltas; uncapped, the flood evicts every earlier step's
 // consolidated event and the run renders as one live block. The dropped
@@ -2063,23 +2112,49 @@ export const EVENT_WINDOW = 500;
 // accumulated reasoning/content.
 export const LIVE_DELTA_CAP = 200;
 
+// Lifecycle/group events that are ordering anchors, not stream payload:
+// groupTranscriptItems sorts a turn at its run's terminal event and a user
+// message at its run's run.accepted, and groupStateFromEvents replays the
+// group.* banner state. Evicting an older run's anchors (a long group
+// session outgrows the window) scrambles the transcript order, so these stay
+// for every run and only the high-volume stream is capped to the tail.
+const EVENT_ANCHOR_TYPES = new Set<HarnessEvent["type"]>([
+  "run.accepted",
+  "run.completed",
+  "run.cancelled",
+  "run.failed",
+  "group.created",
+  "group.joined",
+  "group.started",
+  "group.turn.prepared",
+  "group.turn.started",
+  "group.completed",
+  "group.abstained",
+]);
+
 // Snapshot hydration keeps structural events so a refresh can reconstruct
 // reasoning/tool boundaries. Streaming deltas are redundant once their step is
 // consolidated, so retain only the latest bounded delta tail.
 export function compactEventWindow(events: HarnessEvent[]): HarnessEvent[] {
   if (events.length <= EVENT_WINDOW) return events;
+  const anchors = events.filter((event) => EVENT_ANCHOR_TYPES.has(event.type));
+  const anchorIds = new Set(anchors.map((event) => event.eventId));
   const deltaIds = new Set(
     events
-      .filter((event) => event.type === "reasoning.delta" || event.type === "text.delta")
+      .filter((event) => !anchorIds.has(event.eventId) && (event.type === "reasoning.delta" || event.type === "text.delta"))
       .slice(-LIVE_DELTA_CAP)
       .map((event) => event.eventId),
   );
-  const kept = events.filter((event) =>
-    event.type !== "reasoning.delta" && event.type !== "text.delta" || deltaIds.has(event.eventId),
+  const nonAnchors = events.filter((event) =>
+    !anchorIds.has(event.eventId) &&
+    (event.type !== "reasoning.delta" && event.type !== "text.delta" || deltaIds.has(event.eventId)),
   );
-  // Keep the recent structural tail if an unusually large legacy ledger has
-  // more structural rows than the normal UI window.
-  return kept.length > EVENT_WINDOW ? kept.slice(-EVENT_WINDOW) : kept;
+  // The anchors are always kept; the remaining stream fills the rest of the
+  // budget from the recent tail. If the anchors alone exceed the window (a
+  // very long session) they win - dropping an ordering anchor is the bug.
+  const budget = Math.max(0, EVENT_WINDOW - anchors.length);
+  const keptIds = new Set([...anchors, ...nonAnchors.slice(-budget)].map((event) => event.eventId));
+  return events.filter((event) => keptIds.has(event.eventId));
 }
 
 // Advance the client's event window with one streamed event. Consolidated
@@ -2289,6 +2364,22 @@ class HttpHarnessClient implements HarnessClient {
       method: "POST",
       body: JSON.stringify({ rounds }),
     });
+  }
+
+  // Group chat invite: append a profile to an existing conversation (a 1:1
+  // session becomes a group; a group gains a speaker). The daemon composes
+  // the roster; the response carries the post-join speaking order.
+  async addSessionSpeaker(sessionId: string, profileId: string): Promise<string[]> {
+    const data = await this.request<{ ok: boolean; speakers: string[]}>(
+      `/sessions/${encodeURIComponent(sessionId)}/speakers`,
+      {
+        method: "POST",
+        body: JSON.stringify({ add: profileId }),
+      },
+    );
+    return Array.isArray(data.speakers)
+      ? data.speakers.filter((speaker) => typeof speaker === "string")
+      : [];
   }
 
   async getSessionStatus(sessionId: string): Promise<HarnessSessionStatus> {
@@ -3891,6 +3982,24 @@ export class FixtureHarnessClient implements HarnessClient {
     session.groupRoundsOverride = rounds === null ? undefined : rounds;
     const snapshot = this.snapshots.get(sessionId);
     if (snapshot?.session) snapshot.session.groupRoundsOverride = session.groupRoundsOverride;
+  }
+
+  // Group chat invite: the fixture appends to the session's live roster
+  // (the daemon is the authority in http mode; the fixture mirrors the
+  // invite contract).
+  async addSessionSpeaker(sessionId: string, profileId: string): Promise<string[]> {
+    const session = this.sessions.find((item) => item.id === sessionId);
+    if (!session) return [];
+    const roster = session.speakers && session.speakers.length > 0
+      ? [...session.speakers]
+      : session.profile
+        ? [session.profile]
+        : [];
+    if (!roster.includes(profileId)) roster.push(profileId);
+    session.speakers = roster;
+    const snapshot = this.snapshots.get(sessionId);
+    if (snapshot?.session) snapshot.session.speakers = [...roster];
+    return [...roster];
   }
 
   async loadSession(sessionId: string): Promise<HarnessSnapshot> {

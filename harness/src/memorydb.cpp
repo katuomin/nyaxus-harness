@@ -575,7 +575,10 @@ long long MemoryDb::insert_unit(const UnitSpec& spec, std::string& error) {
     bind_text(stmt, 4, spec.profile);
     bind_text(stmt, 5, spec.run_id);
     sqlite3_bind_double(stmt, 6, spec.confidence);
-    bind_text(stmt, 7, spec.mentioned_at);
+    // Record-time side of the bi-temporal pair: the caller that leaves it
+    // empty (extraction carries only the event-side date) still gets the
+    // insert moment, so temporal recall matches on both halves.
+    bind_text(stmt, 7, spec.mentioned_at.empty() ? now : spec.mentioned_at);
     bind_text(stmt, 8, spec.occurred_start);
     bind_text(stmt, 9, spec.occurred_end);
     bind_text(stmt, 10, now);

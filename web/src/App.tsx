@@ -68,6 +68,7 @@ import {
 } from "lucide-react";
 import {
   advanceEventWindow,
+  canLoadEarlier,
   composerPlaceholder,
   createHarnessClient,
   mergePromptSnippets,
@@ -2249,6 +2250,26 @@ const ToolRow = memo(function ToolRow({
           />
         ) : (
           <>
+            {/* Completed rows keep the terminal frame (live browsing renders
+                the sticky panel instead, so the same frame does not show
+                twice on one screen). */}
+            {tool.progress?.status === "browsing" && tool.status !== "running" && (
+              <div className="tool-browse-card">
+                <div className="tool-browse-head">
+                  <span className="tool-browse-pulse" />
+                  <span className="tool-browse-label">working in a browser tab</span>
+                  {tool.progress.url && (
+                    <a className="tool-browse-open" href={tool.progress.url} target="_blank" rel="noreferrer">open tab</a>
+                  )}
+                </div>
+                {tool.progress.frame
+                  ? <img className="tool-browse-frame" src={tool.progress.frame} alt={tool.progress.title || "page"} />
+                  : <div className="tool-browse-copy">
+                      <strong>{tool.progress.title || "opening page"}</strong>
+                      <span>{tool.progress.url || tool.target}</span>
+                    </div>}
+              </div>
+            )}
             {tool.arguments && (
               <div className="tool-detail">
                 <label>input</label>
@@ -2285,6 +2306,39 @@ const ToolRow = memo(function ToolRow({
         )}
       </div>
     </details>
+  );
+});
+
+// Sticky browser panel: the live "screen" of the agent's browsing. Rendered
+// inline at the browsing turn in the transcript; position:sticky pins it to
+// the top of the chat viewport once scrolled past, so the page stays visible
+// while the agent's messages and tool actions stream in below. Follows the
+// LATEST tool carrying browsing progress; auto-collapses to a compact chip
+// when that tool completes (manual toggle wins either way).
+const BrowserPanel = memo(function BrowserPanel({ tool, open, onToggle }: {
+  tool: HarnessTool;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const progress = tool.progress;
+  if (!progress) return null;
+  return (
+    <div className="browser-panel">
+      <div className="tool-browse-head">
+        <span className="tool-browse-pulse" />
+        <span className="tool-browse-label">working in a browser tab</span>
+        <button type="button" className="tool-browse-toggle" onClick={onToggle}>{open ? "hide" : "show"}</button>
+        {progress.url && (
+          <a className="tool-browse-open" href={progress.url} target="_blank" rel="noreferrer">open tab</a>
+        )}
+      </div>
+      {open && (progress.frame
+        ? <img className="tool-browse-frame" src={progress.frame} alt={progress.title || "page"} />
+        : <div className="tool-browse-copy">
+            <strong>{progress.title || "opening page"}</strong>
+            <span>{progress.url || tool.target}</span>
+          </div>)}
+    </div>
   );
 });
 
@@ -3174,6 +3228,7 @@ function Composer({
   groupSpeakers,
   onGroupSpeakers,
   fixedSpeakers,
+  onInviteSpeaker,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -3194,10 +3249,13 @@ function Composer({
   sessionKey: string;
   // Group chat (docs/group-chat.md): the speaker roster picked for the next
   // send (2+ creates a group session); fixedSpeakers (an existing group
-  // session) shows the immutable composition.
+  // session) shows the fixed existing members plus the invite affordance.
   groupSpeakers: string[];
   onGroupSpeakers: (ids: string[]) => void;
   fixedSpeakers?: string[];
+  // Invite: append a profile to this conversation (1:1 -> group; a group
+  // gains a speaker). Absent when there is no conversation to invite into.
+  onInviteSpeaker?: (id: string) => void;
 }) {
   const [attachments, setAttachments] = useState<HarnessAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -3631,7 +3689,9 @@ function Composer({
           <div className="group-picker">
             <div className="group-picker-head">
               group speakers - order is the speaking order
-              {fixedSpeakers && <span className="group-picker-fixed">roster fixed for this group</span>}
+              {fixedSpeakers && (
+                <span className="group-picker-fixed">{onInviteSpeaker ? "existing speakers are fixed - invite adds one at the end" : "roster fixed for this group"}</span>
+              )}
               {!fixedSpeakers && groupRoster.length > 0 && (
                 <button type="button" className="group-picker-clear" onClick={() => onGroupSpeakers([])}>clear</button>
               )}
@@ -3653,6 +3713,33 @@ function Composer({
                 <span className="group-picker-name">{item.name}</span>
               </label>
             ))}
+            {/* Invite (docs/group-chat.md): an existing conversation offers
+                the profiles it does not carry yet; picking one appends it to
+                the speaking order - the 1:1 agent stays first. */}
+            {fixedSpeakers && fixedSpeakers.length > 0 && onInviteSpeaker && (
+              (() => {
+                const invitees = profiles.filter((item) => !fixedSpeakers.includes(item.id));
+                if (invitees.length === 0) return null;
+                return (
+                  <div className="group-picker-invite">
+                    <div className="group-picker-invite-head">invite to this conversation</div>
+                    {invitees.map((item) => (
+                      <div key={item.id} className="group-picker-row group-picker-invite-row" title={item.description || item.id}>
+                        <span className="group-picker-name">{item.name}</span>
+                        <button
+                          type="button"
+                          className="group-picker-add"
+                          disabled={disabled}
+                          onClick={() => onInviteSpeaker(item.id)}
+                        >
+                          invite
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()
+            )}
             {!fixedSpeakers && groupRoster.length === 1 && <div className="group-picker-hint">pick at least one more speaker to open a group</div>}
           </div>
         )}
@@ -4197,6 +4284,7 @@ function ChatView({
   onAnswerInput,
   onAnswerSudo,
   onSetGroupRounds,
+  onInviteSpeaker,
   onContextDecision,
   onRegenerate,
   onContinueFailedRun,
@@ -4266,6 +4354,8 @@ function ChatView({
   onAnswerInput: (choice: number) => void;
   onAnswerSudo: (password: string, scope: string) => void;
   onSetGroupRounds: (rounds: number | null) => void;
+  // Invite: append a profile to this conversation (1:1 -> group).
+  onInviteSpeaker: (id: string) => void;
   onContextDecision: (decision: "primary" | "deterministic" | "retry") => void;
   onRegenerate?: (runId: string) => void;
   onContinueFailedRun: (runId: string) => void;
@@ -4374,6 +4464,33 @@ function ChatView({
     ? path.find((message) => message.role === "assistant" && message.runId === activityRun.id)?.id
     : undefined;
 
+  // ── sticky browser panel ────────────────────────────────────────────────
+  // The live screen of the CURRENTLY RUNNING browsing tool (the camofox
+  // tier). Anchored to the browsing turn in the transcript; sticky CSS
+  // pins it to the chat viewport top once scrolled past. It exists only
+  // while the tool runs - on completion the finished tool row's card takes
+  // over (terminal frame), so no duplicate element lingers. A manual hide
+  // wins until the next browsing tool starts.
+  const browseTool = useMemo(() => {
+    const tools = run?.tools.filter((candidate) =>
+      candidate.progress?.status === "browsing" && candidate.status === "running") ?? [];
+    return tools.length ? tools[tools.length - 1] : null;
+  }, [run]);
+  const browseAnchorId = browseTool && run
+    ? path.find((message) => message.role === "assistant" && message.runId === run.id)?.id ?? null
+    : null;
+  const [browseUserOpen, setBrowseUserOpen] = useState<boolean | null>(null);
+  const browsePrevId = useRef<string | null>(null);
+  useEffect(() => {
+    const id = browseTool?.id ?? null;
+    if (browsePrevId.current !== id) {
+      browsePrevId.current = id;
+      setBrowseUserOpen(null);
+    }
+  }, [browseTool]);
+  const browseOpen = browseUserOpen ?? true;
+  const toggleBrowse = useCallback(() => setBrowseUserOpen((open) => !open), []);
+
   // Restore the previous session's reading position after the new content
   // commits (layout effect: before the browser paints).
   useLayoutEffect(() => {
@@ -4428,7 +4545,7 @@ function ChatView({
   }, [windowStart]);
 
   const loadEarlier = () => {
-    if (windowStart === 0) return;
+    if (!canLoadEarlier(windowStart, pathLength)) return;
     const el = scrollRef.current;
     if (el) anchorRef.current = { top: el.scrollTop, height: el.scrollHeight };
     setFrozenStart(Math.max(0, windowStart - CHAT_WINDOW_SIZE));
@@ -4694,6 +4811,18 @@ function ChatView({
               </div>
             </div>
           )}
+          {/* Bounded display history (roadmap #5): the strip marks the
+              mount boundary. Under the cap the reader scrolls up and earlier
+              turns load in chunks; at the cap (HISTORY_MAX_LINES) the older
+              turns stay ledger-only - search / the session graph jump there. */}
+          {windowStart > 0 && (
+            <div className="history-bound" role="note">
+              <span className="abstain-dot" />
+              {canLoadEarlier(windowStart, pathLength)
+                ? <span>{windowStart} earlier turn{windowStart === 1 ? "" : "s"} - scroll up to load</span>
+                : <span>{windowStart} earlier turns stay in the ledger - jump from search or the session graph</span>}
+            </div>
+          )}
           {groupSpeakers
             ? groupItems.map((item) => {
                 if (item.kind === "abstained") {
@@ -4708,7 +4837,9 @@ function ChatView({
                 const messageActivity = activityRun && activityAnchorId === message.id ? activityRun : undefined;
                 const derived = derivedForMessage(session?.id || "", message, events, runEventCounts);
                 return (
-                <div key={message.id} id={`turn-${message.id}`} className="turn-anchor">
+                <Fragment key={message.id}>
+                  {browseTool && browseAnchorId === message.id && <BrowserPanel tool={browseTool} open={browseOpen} onToggle={toggleBrowse} />}
+                  <div id={`turn-${message.id}`} className="turn-anchor">
                   <TurnBlock
                     message={message}
                     allMessages={messages}
@@ -4736,7 +4867,8 @@ function ChatView({
                     taskRecords={taskRecords}
                     subagent={{ events, client, onOpenSession }}
                   />
-                </div>
+                  </div>
+                </Fragment>
                 );
               })
             : visiblePath.map((message) => {
@@ -4745,7 +4877,9 @@ function ChatView({
                 const messageReasoning = derived.segments;
                 const messageBlocks = derived.blocks;
                 return (
-                <div key={message.id} id={`turn-${message.id}`} className="turn-anchor">
+                <Fragment key={message.id}>
+                  {browseTool && browseAnchorId === message.id && <BrowserPanel tool={browseTool} open={browseOpen} onToggle={toggleBrowse} />}
+                  <div id={`turn-${message.id}`} className="turn-anchor">
                   <TurnBlock
                     message={message}
                     allMessages={messages}
@@ -4772,14 +4906,23 @@ function ChatView({
                     taskRecords={taskRecords}
                     subagent={{ events, client, onOpenSession }}
                   />
-                </div>
+                  </div>
+                </Fragment>
                 );
               })}
           {/* Standalone tool group only while the run is in flight (no
               persisted assistant message to anchor it yet). A completed run
               whose message was trimmed by a rewind has no anchor and must not
-              float its tool calls - that is the stale-`run` visual. */}
-          {activityRun && activityAnchorId === undefined && isRunActive(activityRun.status) && <ActivityGroup run={activityRun} onApproval={onApproval} onAnswerInput={onAnswerInput} onAnswerSudo={onAnswerSudo} />}
+              float its tool calls - that is the stale-`run` visual. The group
+              itself stays decision-only: a streaming bar for terminal calls
+              just duplicated the streaming pill, while an approval or input
+              gate has no other chat-side UI in this unanchored window. */}
+          {browseTool && browseAnchorId === null && activityRun && activityAnchorId === undefined && (
+            <BrowserPanel tool={browseTool} open={browseOpen} onToggle={toggleBrowse} />
+          )}
+          {activityRun && activityAnchorId === undefined
+            && (activityRun.status === "waiting_approval" || activityRun.status === "waiting_input")
+            && <ActivityGroup run={activityRun} onApproval={onApproval} onAnswerInput={onAnswerInput} onAnswerSudo={onAnswerSudo} />}
           {/* Pinned only while the checklist is live (0/N .. n/N): once
               every item is done the card lingers in the transcript at the
               last tick, and a tasks.create [] discard keeps the card at the
@@ -4840,7 +4983,7 @@ function ChatView({
             <Route size={12} /> {steerFlash.text}
           </div>
         )}
-        <Composer value={draft} onChange={onDraft} onSend={handleSend} onStop={onStop} disabled={!!session && !connected} streaming={streaming} profile={session?.profile || draftProfile} model={run?.model || session?.model || "local model"} profiles={profiles} providers={providers} defaultProvider={defaultProvider} onSelectProfile={onSelectProfile} run={run} seed={composerSeed && composerSeed.sessionId === session?.id ? composerSeed : null} onListFs={onListFs} onListSnippets={onListSnippets} sessionKey={session?.id || "draft"} groupSpeakers={groupDraft} onGroupSpeakers={onGroupSpeakers} fixedSpeakers={session?.speakers} />
+        <Composer value={draft} onChange={onDraft} onSend={handleSend} onStop={onStop} disabled={!!session && !connected} streaming={streaming} profile={session?.profile || draftProfile} model={run?.model || session?.model || "local model"} profiles={profiles} providers={providers} defaultProvider={defaultProvider} onSelectProfile={onSelectProfile} run={run} seed={composerSeed && composerSeed.sessionId === session?.id ? composerSeed : null} onListFs={onListFs} onListSnippets={onListSnippets} sessionKey={session?.id || "draft"} groupSpeakers={groupDraft} onGroupSpeakers={onGroupSpeakers} fixedSpeakers={session?.speakers} onInviteSpeaker={onInviteSpeaker} />
       </section>
       {inspectorOpen && <RunInspector run={run} events={events} artifacts={artifacts} onApproval={onApproval} onAnswerInput={onAnswerInput} onAnswerSudo={onAnswerSudo} sessionPackRevision={session?.packRevision} session={session} onLinkVault={onLinkVault} onUnlinkVault={onUnlinkVault} onListFs={onListFs} profiles={profiles} sources={sources} onSelectProfile={onSelectProfile} onCompactContext={onCompactContext} onRenameSession={onRenameSession} onSetSessionTags={onSetSessionTags} onRetitleSession={onRetitleSession} onGetJourney={onGetJourney} onRequestJourneyUpdate={onRequestJourneyUpdate} />}
     </div>
@@ -9358,6 +9501,29 @@ function App() {
             return { ...previous, retry: undefined, tools, status: "running" };
           });
         }
+        if (event.type === "tool.progress") {
+          // Ephemeral mid-flight state: the camofox tier announces the page
+          // it opened (title/URL) so the running tool row can render the
+          // live "working in a browser" card.
+          const id = String(event.payload.tool_id || "");
+          const status = String(event.payload.status || "");
+          if (id && status) {
+            const progress: HarnessTool["progress"] = {
+              status,
+              ...(event.payload.title !== undefined ? { title: String(event.payload.title) } : {}),
+              ...(event.payload.url !== undefined ? { url: String(event.payload.url) } : {}),
+              ...(event.payload.frame !== undefined ? { frame: String(event.payload.frame) } : {}),
+            };
+            setRun((previous) => {
+              if (!previous) return previous;
+              const tools = previous.tools.map((candidate) =>
+                candidate.id === id && candidate.status === "running"
+                  ? { ...candidate, progress }
+                  : candidate);
+              return { ...previous, tools };
+            });
+          }
+        }
         if (event.type === "tool.completed") {
           const id = String(event.payload.tool_id || event.eventId);
           const result = String(event.payload.result || event.payload.summary || event.payload.error || "");
@@ -10535,6 +10701,20 @@ function App() {
       notify("failed", `could not set the rounds: ${error instanceof Error ? error.message : String(error)}`, currentSessionId, true);
     }
   });
+  // Group chat invite (docs/group-chat.md): append a profile to the current
+  // conversation - a 1:1 becomes a group; a group gains a speaker. The
+  // daemon composes and returns the post-join speaking order.
+  const chatOnInviteSpeaker = useEventCallback(async (profileId: string) => {
+    if (!currentSessionId) return;
+    try {
+      const speakers = await client.addSessionSpeaker(currentSessionId, profileId);
+      setSessions((previous) => previous.map((item) => item.id === currentSessionId
+        ? { ...item, speakers: speakers.length > 0 ? speakers : item.speakers }
+        : item));
+    } catch (error) {
+      notify("failed", `could not invite the speaker: ${error instanceof Error ? error.message : String(error)}`, currentSessionId, true);
+    }
+  });
   const chatOnRegenerate = useEventCallback(async (runId: string) => void regenerateMessage(runId));
   // Retry-that-continues (docs/stream-rules): the ErrorBar's retry resumes
   // the interrupted turn from its persisted partial answer instead of
@@ -10581,7 +10761,7 @@ function App() {
           {pendingPhase && <div className="loading-bar" role="status" aria-label={pendingPhase} />}
           <div className="main-content">
             {view === "home" && <HomeView sessions={sessions} run={run} profilesCount={profiles.length} onNew={() => void createSession()} onSession={(id) => { setCurrentSessionId(id); setView("chat"); }} onView={(next) => setView(next)} />}
-            {view === "chat" && <div className="view-form"><ChatErrorBoundary><ChatView session={currentSession} messages={messages} run={run} events={events} client={client} onOpenSession={openWorkerSession} artifacts={artifacts} status={sessionStatus} draft={draft} onDraft={setDraft} onSend={(content, attachments, mentions, speakers) => void sendMessage(content, attachments, mentions, speakers)} onStop={() => void stopRun()} groupDraft={groupDraft} onGroupSpeakers={setGroupDraft} onApproval={chatOnApproval} onAnswerInput={chatOnAnswerInput} onAnswerSudo={chatOnAnswerSudo} onSetGroupRounds={chatOnSetGroupRounds} onContextDecision={(decision) => void respondContextDecision(decision)} onRegenerate={chatOnRegenerate} onContinueFailedRun={chatOnContinueFailedRun} onSelectIteration={chatOnSelectIteration} onSelectProfile={(id) => void selectProfile(id)} onSearch={(query) => client.searchSession(currentSessionId, query)} profiles={profiles} providers={providers} defaultProvider={defaultProvider} draftProfile={draftProfile} connected={connected} disconnectedDetail={pendingPhase} stalled={streamStalled} inspectorOpen={inspectorOpen} dismissedRetryRun={dismissedRetryRun} dismissFailedRun={dismissFailedRun} queuedPrompts={queuedPrompts.filter((item) => item.sessionId === currentSessionId)} onQueueEdit={(item) => void editQueuedPrompt(item)} onQueueRemove={(item) => void removeQueuedPrompt(item)} onQueueSteer={(item) => void steerQueuedPrompt(item)} onQueueDeliverNow={(item) => void deliverQueuedPromptNow(item)} onQueueSendNow={() => void sendNowQueuedPrompt()} onCompactContext={() => void compactContext()} steeringQueueIds={steeringQueueIds} steerFlash={steerFlash} composerSeed={composerSeed} onListSnippets={() => client.listPromptSnippets()} onEdit={chatOnEdit} onDelete={chatOnDelete} onRewindHere={chatOnRewindHere} onFork={(mode) => void forkConversation(mode)} onSelectMessage={chatOnSelectMessage} onLinkVault={(path) => void linkVault(currentSessionId, path)} onUnlinkVault={() => void unlinkVault(currentSessionId)} onListFs={(path) => client.listFs(path)} onRenameSession={(title) => void renameSession(currentSessionId, title)} onSetSessionTags={(tags) => void setSessionTags(currentSessionId, tags)} onRetitleSession={() => void retitleSession(currentSessionId)} onGetJourney={getJourney} onRequestJourneyUpdate={requestJourneyUpdate} onExport={exportConversation} sources={sources} pendingJump={pendingJump} onJumpHandled={() => setPendingJump(null)} /></ChatErrorBoundary></div>}
+            {view === "chat" && <div className="view-form"><ChatErrorBoundary><ChatView session={currentSession} messages={messages} run={run} events={events} client={client} onOpenSession={openWorkerSession} artifacts={artifacts} status={sessionStatus} draft={draft} onDraft={setDraft} onSend={(content, attachments, mentions, speakers) => void sendMessage(content, attachments, mentions, speakers)} onStop={() => void stopRun()} groupDraft={groupDraft} onGroupSpeakers={setGroupDraft} onApproval={chatOnApproval} onAnswerInput={chatOnAnswerInput} onAnswerSudo={chatOnAnswerSudo} onSetGroupRounds={chatOnSetGroupRounds} onInviteSpeaker={(id) => void chatOnInviteSpeaker(id)} onContextDecision={(decision) => void respondContextDecision(decision)} onRegenerate={chatOnRegenerate} onContinueFailedRun={chatOnContinueFailedRun} onSelectIteration={chatOnSelectIteration} onSelectProfile={(id) => void selectProfile(id)} onSearch={(query) => client.searchSession(currentSessionId, query)} profiles={profiles} providers={providers} defaultProvider={defaultProvider} draftProfile={draftProfile} connected={connected} disconnectedDetail={pendingPhase} stalled={streamStalled} inspectorOpen={inspectorOpen} dismissedRetryRun={dismissedRetryRun} dismissFailedRun={dismissFailedRun} queuedPrompts={queuedPrompts.filter((item) => item.sessionId === currentSessionId)} onQueueEdit={(item) => void editQueuedPrompt(item)} onQueueRemove={(item) => void removeQueuedPrompt(item)} onQueueSteer={(item) => void steerQueuedPrompt(item)} onQueueDeliverNow={(item) => void deliverQueuedPromptNow(item)} onQueueSendNow={() => void sendNowQueuedPrompt()} onCompactContext={() => void compactContext()} steeringQueueIds={steeringQueueIds} steerFlash={steerFlash} composerSeed={composerSeed} onListSnippets={() => client.listPromptSnippets()} onEdit={chatOnEdit} onDelete={chatOnDelete} onRewindHere={chatOnRewindHere} onFork={(mode) => void forkConversation(mode)} onSelectMessage={chatOnSelectMessage} onLinkVault={(path) => void linkVault(currentSessionId, path)} onUnlinkVault={() => void unlinkVault(currentSessionId)} onListFs={(path) => client.listFs(path)} onRenameSession={(title) => void renameSession(currentSessionId, title)} onSetSessionTags={(tags) => void setSessionTags(currentSessionId, tags)} onRetitleSession={() => void retitleSession(currentSessionId)} onGetJourney={getJourney} onRequestJourneyUpdate={requestJourneyUpdate} onExport={exportConversation} sources={sources} pendingJump={pendingJump} onJumpHandled={() => setPendingJump(null)} /></ChatErrorBoundary></div>}
             {view === "runs" && <RunsView sessions={sessions} run={run} onOpen={(id) => { setCurrentSessionId(id); setView("chat"); setSidebarOpen(false); }} />}
             {view === "graph" && <GraphView session={currentSession} rows={graphRows} runs={graphRuns} onOpenChat={(messageId) => { if (messageId != null && !messages.some((m) => m.id === messageId && m.isActive)) void selectMessageBranch(messageId); setPendingJump(messageId); setView("chat"); }} onSelectBranch={(id) => void selectMessageBranch(id)} onRewind={(message) => rewindHere(message)} />}
             {view === "memory" && <MemoryView currentSessionId={currentSessionId} onStatus={() => client.memoryStatus()} onRecall={(input) => client.memoryRecall(input)} onBank={(input) => client.memoryBank(input)} onUnitDetail={(id) => client.getMemoryUnit(id)} onInvalidateUnit={(id, reason) => client.invalidateMemoryUnit(id, reason)} onReactivateUnit={(id, reason) => client.reactivateMemoryUnit(id, reason)} onSupersedeUnit={(id, text, reason) => client.supersedeMemoryUnit(id, text, reason)} onDeleteUnit={(id) => client.deleteMemoryUnit(id)} onSetUnitCore={(id, on) => client.setMemoryUnitCore(id, on)} onConsolidate={() => client.consolidateMemory()} onListRecords={(status) => client.listMemoryRecords(status)} onCreateRecord={(input) => client.createMemoryRecord(input)} onApproveRecord={(id) => client.approveMemoryRecord(id)} onRejectRecord={(id) => client.rejectMemoryRecord(id)} onListConsolidations={(status) => client.listConsolidations(status)} onApproveConsolidation={(id) => client.approveConsolidation(id)} onRejectConsolidation={(id) => client.rejectConsolidation(id)} />}

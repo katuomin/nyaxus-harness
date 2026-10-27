@@ -436,7 +436,19 @@ struct Candidate {
     std::string type = "experience";
     std::string text;
     double confidence = 0.5;
+    std::string occurred_start;  // event-side date, empty unless stated
 };
+
+// Empty passes (the turn stated no date; the field stays honest).
+// YYYY-MM-DD passes; anything the model fumbled into the field is emptied.
+bool is_iso_date(const std::string& value) {
+    if (value.size() != 10 || value[4] != '-' || value[7] != '-') return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i == 4 || i == 7) continue;
+        if (value[i] < '0' || value[i] > '9') return false;
+    }
+    return true;
+}
 
 bool parse_candidates(const std::string& raw, std::vector<Candidate>& out, std::string& error) {
     const std::string text = strip_code_fences(raw);
@@ -460,6 +472,8 @@ bool parse_candidates(const std::string& raw, std::vector<Candidate>& out, std::
         candidate.type = item.at("type").as_string("experience");
         candidate.text = item.at("text").as_string("");
         candidate.confidence = item.at("confidence").as_number(0.5);
+        const std::string occurred = item.at("occurred_start").as_string("");
+        candidate.occurred_start = is_iso_date(occurred) ? occurred : "";
         out.push_back(std::move(candidate));
     }
     if (out.empty()) {
@@ -481,6 +495,7 @@ struct DedupOutcome {
     std::string action;  // "store" | "skip" | "replace"
     std::string text;    // text to store (candidate text, or merged text)
     std::string type;    // type to store
+    std::string occurred_start;  // event-side date, carried from the candidate
     std::vector<long long> retire;  // units to propose retiring (replace only)
     double sim = 0.0;  // max cosine to a related unit (the proposal's similarity)
 };
@@ -495,6 +510,7 @@ struct DedupNewEntry {
     std::string id;  // stable id within this batch (c0, c1, ...)
     std::string text;
     std::string type;
+    std::string occurred_start;
     std::vector<long long> related;  // existing unit ids (the pool)
     double max_sim = 0.0;
 };
@@ -577,6 +593,7 @@ std::vector<DedupOutcome> parse_dedup_decisions(
         outcome.action = "store";
         outcome.text = new_entries[i].text;
         outcome.type = new_entries[i].type;
+        outcome.occurred_start = new_entries[i].occurred_start;
         outcomes.push_back(std::move(outcome));
     }
     const std::string text = strip_code_fences(raw);
@@ -642,6 +659,7 @@ std::vector<DedupOutcome> dedup_extract(
         outcome.action = "store";
         outcome.text = candidate.text;
         outcome.type = candidate.type;
+        outcome.occurred_start = candidate.occurred_start;
         outcomes.push_back(std::move(outcome));
     }
     if (!dedup) return outcomes;
@@ -655,6 +673,7 @@ std::vector<DedupOutcome> dedup_extract(
         entry.id = "c" + std::to_string(i);
         entry.text = candidates[i].text;
         entry.type = candidates[i].type;
+        entry.occurred_start = candidates[i].occurred_start;
         if (i < embeddings.size() && !embeddings[i].empty()) {
             std::string error;
             const std::vector<std::pair<long long, double>> similar =
@@ -819,6 +838,7 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
             outcome.action = "store";
             outcome.text = p.candidate->text;
             outcome.type = p.candidate->type;
+            outcome.occurred_start = p.candidate->occurred_start;
             outcomes.push_back(std::move(outcome));
         }
     }
@@ -858,6 +878,7 @@ RetainResult retain(MemoryDb& db, const qwen3::Model& embed_model, const RetainS
         unit_spec.prompt_revision = spec.prompt_revision;
         unit_spec.generation_id = spec.generation_id;
         unit_spec.confidence = p.candidate->confidence;
+        unit_spec.occurred_start = outcome.occurred_start;
         if (!spec.run_id.empty()) {
             unit_spec.sources.push_back({spec.run_id, ""});
         }

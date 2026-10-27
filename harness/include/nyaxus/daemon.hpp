@@ -215,6 +215,14 @@ struct Config {
     // Bearer token for the Camofox server (CAMOFOX_ACCESS_KEY); empty = the
     // server runs without route auth.
     std::string web_camofox_token;
+    // Sticky camofox session (web.camofox_sticky): keep the browser tab (and
+    // the per-session userId profile: cookies, logins) alive across fetches
+    // instead of open/snapshot/close per call. Off by default.
+    bool web_camofox_sticky = false;
+    // Idle-reaper TTL for sticky tabs: a tab the session has not used for
+    // this many minutes is closed at the next sticky fetch's entry. 0 reaps
+    // every idle tab at each entry (tests; aggressive ops opt-in).
+    long long web_camofox_sticky_ttl_minutes = 15;
     // Observatory container scoping (docs/infra-observability.md): a
     // comma-separated allowlist of container names; empty = all containers
     // on the host. Lets one daemon watch a subset (e.g. just the llama
@@ -1059,6 +1067,50 @@ void sudo_grant_use_once(const std::string& pw_path, const std::string& askpass_
 // Clears the cache (and its files): wrong password, or teardown.
 void sudo_grant_revoke();
 
+// ── sticky camofox session (web.camofox_sticky) ──────────────────────
+// The web.fetch tier-2 keeps its browser alive per session instead of
+// open/snapshot/close per call: a per-session userId gives the browser
+// profile durable cookies (logins survive), and tabs persist so a repeated
+// fetch navigates the existing tab. Concurrency: a busy tab is never
+// navigated - a fetch that arrives while another uses the tab opens its own
+// (one tab per in-flight FETCH, so tool waves never fight over navigation);
+// the idle reaper closes tabs unused for web.camofox_sticky_ttl minutes.
+struct StickyCamofoxTab {
+    std::string tab_id;
+    std::string url;
+    std::chrono::steady_clock::time_point last_used;
+    bool busy = false;
+};
+
+std::mutex camofox_tabs_mutex_;
+
+std::map<std::string, std::vector<StickyCamofoxTab>> camofox_tabs_;
+
+// Closes (returns the ids of) the session's stale sticky tabs: idle past
+// the TTL and not busy. The registry drops them; the caller issues the
+// DELETEs against the camofox server outside the lock.
+std::vector<std::string> camofox_reap_stale_tabs(const std::string& sid,
+                                                 long long ttl_minutes);
+
+// Takes the session's idle sticky tab out for use (marks it busy + touches
+// last_used); "" when every tab is busy or none is registered.
+std::string camofox_take_idle_tab(const std::string& sid);
+
+// Registers a freshly opened tab as the session's busy sticky tab.
+void camofox_tab_register(const std::string& sid, const std::string& tab_id,
+                          const std::string& url);
+
+// Marks the session's tab finished (idle again + last_used touched).
+void camofox_tab_release(const std::string& sid, const std::string& tab_id);
+
+// Drops one sticky tab from the registry (a tab that failed to navigate or
+// failed to open; the caller deletes it server-side).
+void camofox_tab_drop(const std::string& sid, const std::string& tab_id);
+
+// Forgets the session's sticky tabs (no DELETEs): returns the dropped tab
+// ids so the caller can close them server-side (a session delete).
+std::vector<std::string> camofox_tabs_forget(const std::string& sid);
+
 bool authorized(const std::string& token) const;
 
 provider::Config provider_snapshot() const;
@@ -1368,6 +1420,8 @@ http::Response set_session_tags_route(const http::Request& request);
 
 http::Response set_session_group_rounds_route(const http::Request& request);
 
+http::Response set_session_speakers_route(const http::Request& request);
+
 http::Response retitle_session_route(const http::Request& request);
 
 http::Response select_iteration(const http::Request& request);
@@ -1545,6 +1599,14 @@ bool web_enabled_now();
         // runs with an access key; empty = no auth header.
         std::string camofox_endpoint;
         std::string camofox_token;
+        // Sticky camofox session (web.camofox_sticky): the fetch tier keeps
+        // one live browser per session - a per-session userId (cookies and
+        // logins persist in the browser profile), tabs stay open across
+        // fetches (navigated instead of open+closed), an idle reaper closes
+        // them after web.camofox_sticky_ttl minutes. Off = the ephemeral
+        // open/snapshot/close flow.
+        bool camofox_sticky = false;
+        long long camofox_sticky_ttl_minutes = 15;
     };
 
 WebConfig web_config_snapshot();
@@ -1621,14 +1683,14 @@ std::string web_search_tool(const std::string& query, const CancellationToken& c
 
 std::string web_fetch_via_firecrawl(const std::string& url, const WebConfig& wc, const std::string& sid, const std::string& run_id);
 
-std::string web_fetch_via_camofox(const std::string& url, const WebConfig& wc, const std::string& sid, const std::string& run_id);
+std::string web_fetch_via_camofox(const std::string& url, const WebConfig& wc, const std::string& sid, const std::string& run_id, const std::string& tool_id);
 
 std::map<std::string, std::string> web_fetch_headers();
 
 // Extract + ledger + format a successful native fetch into the [src:N] block.
 std::string web_fetch_finish(const std::string& url, int status, const std::string& body, const WebConfig& wc, const std::string& sid, const std::string& run_id, const std::string& via_note);
 
-std::string web_fetch_tool(const std::string& url, const std::string& via, const WebConfig& wc, const std::string& sid, const std::string& run_id, const CancellationToken& cancellation);
+std::string web_fetch_tool(const std::string& url, const std::string& via, const WebConfig& wc, const std::string& sid, const std::string& run_id, const std::string& tool_id, const CancellationToken& cancellation);
 
 // Cache-served refetch (web fetch resilience): on a failed live fetch, the
 // session's own prior ledger row (status ok) plus the persisted extracted
@@ -1655,7 +1717,7 @@ std::string quiz_tool(const std::string& question, const std::string& options_te
 
 std::string ask_user_question_tool(const std::string& question, const std::string& options_text, const std::string& run_id);
 
-std::string dispatch_tool(const std::string& name, const std::string& arguments, const std::string& sid, const std::string& profile_id, const std::string& run_id, const CancellationToken& cancellation);
+std::string dispatch_tool(const std::string& name, const std::string& arguments, const std::string& sid, const std::string& profile_id, const std::string& run_id, const std::string& tool_id, const CancellationToken& cancellation);
 
 void withdraw_queued_user_message(const std::shared_ptr<Run>& run, const std::shared_ptr<Session>& session);
 

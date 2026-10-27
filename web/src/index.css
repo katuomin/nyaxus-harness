@@ -2385,6 +2385,146 @@ kbd {
   word-break: break-word;
 }
 
+/* Live "working in a browser" card: the camofox fetch tier announces the
+   page it opened (title/URL) and streams page frames (base64 PNG data
+   URLs) via tool.progress; the card is visible while the tool runs and
+   the terminal frame stays on the finished row. */
+.tool-browse-card {
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  overflow: hidden;
+}
+
+.tool-browse-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+}
+
+.tool-browse-pulse {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border: 1px solid var(--cyan);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--cyan-glow);
+  animation: toolPulse 1s ease-in-out infinite alternate;
+}
+
+.tool-browse-idle {
+  animation: none;
+  border-color: var(--ink-muted);
+  box-shadow: none;
+}
+
+.tool-row:not(.tool-row-pending) .tool-browse-pulse {
+  animation: none;
+}
+
+.tool-browse-toggle {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  color: var(--ink-muted);
+  background: none;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.tool-browse-toggle:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+/* The panel is inline in the transcript at the browsing turn; sticky keeps
+   it at the chat viewport top once scrolled past, so the agent's screen
+   stays visible while messages and tool actions stream in below it. It
+   exists only while the browsing tool runs. Width matches the message
+   column (same anchor the pinned task card uses). */
+.browser-panel {
+  position: sticky;
+  top: 8px;
+  z-index: 6;
+  max-width: 760px;
+  margin: 6px auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.tool-browse-label {
+  flex: 1;
+  overflow: hidden;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.tool-browse-open {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 9px;
+  text-decoration: none;
+}
+
+.tool-browse-open:hover {
+  border-color: var(--cyan);
+}
+
+.tool-browse-frame {
+  display: block;
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+  border-top: 1px solid var(--line);
+  object-position: top left;
+}
+
+/* The pinned panel shares the viewport with the transcript it floats over;
+   a shorter frame keeps the agent's actions readable underneath. */
+.browser-panel .tool-browse-frame {
+  max-height: 240px;
+}
+
+.tool-browse-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 8px 6px 8px;
+}
+
+.tool-browse-copy strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-browse-copy span {
+  overflow: hidden;
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-approval {
   margin-top: 7px;
   padding-top: 6px;
@@ -9098,6 +9238,53 @@ button.attachment-token-main {
   font-size: 8px;
 }
 
+/* Invite (an existing conversation gains a speaker): a lightly separated
+   tail section under the roster with explicit per-row invite buttons -
+   checkbox rows below are fixed members, these are candidates. */
+.group-picker-invite {
+  margin-top: 5px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
+}
+
+.group-picker-invite-head {
+  padding: 2px 0;
+  color: var(--ink-muted);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.group-picker-invite-row {
+  cursor: default;
+}
+
+.group-picker-add {
+  flex: none;
+  margin-left: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+}
+
+.group-picker-add:hover {
+  color: var(--surface);
+  background: var(--cyan);
+  border-color: var(--cyan);
+}
+
+.group-picker-add:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Chat: the roundtable banner under the toolbar - roster, live round,
    current speaker (highlighted), and the termination when the group ends. */
 .group-banner {
@@ -9275,4 +9462,17 @@ button.attachment-token-main {
   border-radius: 999px;
   border: 1px solid var(--ink-muted);
   background: transparent;
+}
+
+/* The bounded display history strip at the mounted window's top: the same
+   muted voice as the abstain row, at the transcript's left edge. */
+.history-bound {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 0;
+  padding: 3px 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--ink-muted);
 }

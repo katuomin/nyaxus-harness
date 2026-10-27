@@ -59,7 +59,8 @@ Named configuration stacks (model, prompt pack, memory policy).
 | `POST /api/v1/sessions/{id}/rewind` | move the active leaf back |
 | `POST /api/v1/sessions/{id}/select` | pick a branch leaf |
 | `POST /api/v1/sessions/{id}/search` | full-text session search |
-| `GET /api/v1/sessions/{id}/group-rounds` | group-chat rounds |
+| `POST /api/v1/sessions/{id}/group-rounds` | group chat round budget |
+| `POST /api/v1/sessions/{id}/speakers` | invite a profile into a conversation (1:1 -> group) |
 | `GET /api/v1/sessions/{id}/md-log` | the session's markdown log |
 | `POST /api/v1/sessions/{id}/commands` | submit a command-plane request |
 

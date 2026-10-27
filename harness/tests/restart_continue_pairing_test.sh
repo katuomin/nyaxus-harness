@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# restart_continue_pairing_test.sh — the pairing event for the
+# restart_continue_pairing_test.sh - the pairing event for the
 # restart-recovery retry path (the dead-run continue branch).
 #
 # The Live-run continue handler publishes run.continued; the RESTART-

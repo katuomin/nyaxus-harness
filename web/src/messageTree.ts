@@ -429,14 +429,36 @@ export function mergeOptimisticSnapshot(
   const merged = mergeSnapshotMessages(localMessages, snapshot, preservedRunIds, queuedRunIds, parentSwaps);
   const persistedUser = snapshotMessages.find((message) => message.role === "user" && message.id > 0);
   // Keep the temporary user row as the live assistant's parent until the run
-  // is terminal. The surviving-temp check is load-bearing: when the swap
-  // already replaced the temp with the persisted row, the optimistic temp is
-  // GONE from merged - dropping the persisted row too would orphan the
-  // streamed turn entirely (transcript shows only the working pill until the
-  // run completes and a later reload restores the row). In that case the
-  // persisted row stays: the merge re-pointed live children onto it.
-  const tempUserSurvived = merged.some((message) => message.id === optimisticTurn.user.id);
-  return persistedUser && tempUserSurvived
+  // is terminal. Four cases (the surviving-temp check is load-bearing):
+  // - the swap already replaced the temp with the persisted row: the temp is
+  //   GONE from merged - dropping the persisted row too would orphan the
+  //   streamed turn entirely (transcript shows only the working pill until
+  //   the run completes and a later reload restores the row), so the
+  //   persisted row stays and the merge re-pointed live children onto it;
+  // - a distinct temp still survives (legacy pairing without the client-id
+  //   anchor): it stays the live parent and the persisted duplicate drops;
+  // - App RENAMED the optimistic row onto the daemon's row id when the send
+  //   ack landed (A-7) and the snapshot carries that row: the "temp" IS the
+  //   persisted row now - the old id-match "survived" check matched the
+  //   persisted row against itself and dropped it, so the sent message was
+  //   invisible for the whole run on a new conversation - the row is kept;
+  // - the same rename, but the snapshot raced ahead of the daemon's row
+  //   write and merged lacks the row entirely: the optimistic row is
+  //   re-added so the turn keeps its parent.
+  const optimisticId = optimisticTurn.user.id;
+  const survived = merged.some((message) => message.id === optimisticId);
+  if (persistedUser && persistedUser.id === optimisticId) {
+    if (!survived) merged.push(optimisticTurn.user);
+    return merged;
+  }
+  if (!survived && !persistedUser) {
+    // The optimistic row is gone entirely: the snapshot raced ahead of the
+    // daemon's row write, and positive ids are not resurrected by the merge.
+    // Re-add it so the streamed turn keeps its parent.
+    merged.push(optimisticTurn.user);
+    return merged;
+  }
+  return survived && persistedUser
     ? merged.filter((message) => message.id !== persistedUser.id)
     : merged;
 }

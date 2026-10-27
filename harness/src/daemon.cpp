@@ -578,7 +578,7 @@ const std::string& Daemon::memory_extraction_prompt()
         "Return ONLY a JSON object (no prose, no code fence) of exactly "
         "this shape:\n"
         "{\"candidates\": [{\"type\": \"...\", \"text\": \"...\", "
-        "\"confidence\": 0.0}]}\n\n"
+        "\"confidence\": 0.0, \"occurred_start\": \"...\"}]}\n\n"
         "Types - pick exactly one per candidate:\n"
         "- world: stable facts about the user and their environment - "
         "identity, preferences, relationships, machines, services, "
@@ -611,6 +611,10 @@ const std::string& Daemon::memory_extraction_prompt()
         "implies: decisions, constraints, preferences, environment facts, "
         "hard-won lessons, procedures. Skip small talk, ephemeral task "
         "state, and common knowledge.\n"
+        "- \"occurred_start\" is an ISO date (YYYY-MM-DD) and only for "
+        "experience candidates whose turn explicitly states when the "
+        "event happened. Empty string otherwise. Never guess a date; "
+        "world and other non-event candidates always leave it empty.\n"
         "- Never invent facts. If nothing is worth remembering, return "
         "{\"candidates\": []}";
     return prompt;
@@ -3001,6 +3005,8 @@ void Daemon::install(http::Server& server)
                     [this](const http::Request& req) { return set_session_tags_route(req); });
         server.post("/api/v1/sessions/{id}/group-rounds",
                     [this](const http::Request& req) { return set_session_group_rounds_route(req); });
+        server.post("/api/v1/sessions/{id}/speakers",
+                    [this](const http::Request& req) { return set_session_speakers_route(req); });
         server.post("/api/v1/sessions/{id}/retitle",
                     [this](const http::Request& req) {
                         return retitle_session_route(req);
@@ -8001,6 +8007,28 @@ http::Response Daemon::delete_session_route(const http::Request& request)
         // The session's source ledger is provenance for its answers: it goes
         // with the session, so a deleted session's [src:N] ids stop resolving.
         store_->delete_sources_for_session(sid);
+        // The session's sticky camofox tabs go with it too (best-effort
+        // server-side closes; the registry forgets regardless).
+        if (!config_.web_camofox_endpoint.empty()) {
+            const std::map<std::string, std::string> no_headers;
+            std::map<std::string, std::string> close_headers = {
+                {"Content-Type", "application/json"}};
+            if (!trim_ascii(config_.web_camofox_token).empty()) {
+                close_headers["Authorization"] =
+                    "Bearer " + trim_ascii(config_.web_camofox_token);
+            }
+            const std::string camo_user = "nyaxus-session-" + sid;
+            for (const std::string& tab_id : camofox_tabs_forget(sid)) {
+                std::string close_response;
+                http::request_body("DELETE",
+                                   trim_ascii(config_.web_camofox_endpoint) +
+                                       "/tabs/" + tab_id + "?userId=" + camo_user,
+                                   std::string(), no_headers, close_response,
+                                   5000, nullptr);
+            }
+        } else {
+            camofox_tabs_forget(sid);
+        }
         store_->delete_session(sid);
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -8252,6 +8280,126 @@ http::Response Daemon::set_session_group_rounds_route(const http::Request& reque
         result["rounds"] = rounds > 0
             ? json::Value(static_cast<long long>(rounds))
             : json::Value();  // null = the global setting owns the budget
+        response.body = json::stringify(result);
+        return response;
+    }
+
+http::Response Daemon::set_session_speakers_route(const http::Request& request)
+{
+        http::Response response;
+        response.headers["content-type"] = "application/json";
+        if (!authorized(bearer_token(request))) {
+            response.status = 401;
+            response.reason = "Unauthorized";
+            response.body = "{\"error\":\"unauthorized\"}";
+            return response;
+        }
+        const std::string sid = session_id_from_path(request.path);
+        if (sid.empty()) {
+            response.status = 400;
+            response.reason = "Bad Request";
+            response.body = "{\"error\":\"session id required\"}";
+            return response;
+        }
+        auto session = find_session(sid);
+        if (!session) {
+            response.status = 404;
+            response.reason = "Not Found";
+            response.body = "{\"error\":\"session not found\"}";
+            return response;
+        }
+        json::Value body;
+        try {
+            body = json::parse(request.body);
+        } catch (...) {
+            body = json::Value(json::Value::Type::Object);
+        }
+        // Invite (docs/group-chat.md): add a profile to an existing
+        // conversation, upgrading it to a group. Invite-only: the body is
+        // {"add": profile-id} and the roster grows at the end - removals and
+        // reorders would need rotation-state semantics the group run does
+        // not have. A 1:1 session's effective roster is its nominal profile.
+        if (!body.contains("add") || body["add"].type() != json::Value::Type::String ||
+            body["add"].as_string().empty()) {
+            response.status = 400;
+            response.reason = "Bad Request";
+            response.body = "{\"error\":\"add must be a non-empty profile id string\"}";
+            return response;
+        }
+        const std::string invited = body["add"].as_string();
+        if (!store_->get_profile(invited).has_value()) {
+            response.status = 404;
+            response.reason = "Not Found";
+            response.body = "{\"error\":\"profile not found: " + invited + "\"}";
+            return response;
+        }
+        std::vector<std::string> roster;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            if (!session->speakers.empty()) {
+                for (std::size_t cursor = 0; cursor <= session->speakers.size();) {
+                    const std::size_t comma = session->speakers.find(',', cursor);
+                    const std::string piece = session->speakers.substr(
+                        cursor, comma == std::string::npos
+                                    ? std::string::npos : comma - cursor);
+                    if (!piece.empty()) roster.push_back(piece);
+                    if (comma == std::string::npos) break;
+                    cursor = comma + 1;
+                }
+            } else if (!session->profile.empty()) {
+                roster.push_back(session->profile);
+            }
+        }
+        if (std::find(roster.begin(), roster.end(), invited) != roster.end()) {
+            response.status = 400;
+            response.reason = "Bad Request";
+            response.body = "{\"error\":\"speaker already in the roster\"}";
+            return response;
+        }
+        roster.push_back(invited);
+        if (roster.size() < 2) {
+            response.status = 400;
+            response.reason = "Bad Request";
+            response.body = "{\"error\":\"a group needs at least 2 speakers\"}";
+            return response;
+        }
+        if (session_has_inflight_run(sid)) {
+            response.status = 409;
+            response.reason = "Conflict";
+            response.body = "{\"error\":\"session has an active run; invite after it settles\"}";
+            return response;
+        }
+        // The rotation and the group framing read this CSV; appending keeps
+        // the nominal profile (roster[0], the 1:1 agent) first so memory
+        // tags, the session list, and the journey keep keying on it.
+        std::string csv = roster[0];
+        for (std::size_t i = 1; i < roster.size(); ++i) csv += "," + roster[i];
+        {
+            auto record = store_->get_session(sid);
+            if (!record) {
+                response.status = 404;
+                response.reason = "Not Found";
+                response.body = "{\"error\":\"session not found\"}";
+                return response;
+            }
+            record->speakers = csv;
+            store_->upsert_session(*record);
+        }
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            session->speakers = csv;
+        }
+        // The ledgered roster change survives a reload even before the next
+        // group run: one group.joined per invited speaker, carrying the
+        // post-join roster (the same payload shape group.started emits).
+        const std::string joined_speaker = roster[roster.size() - 1];
+        publish(store_->append_event(
+            sid, "group-" + sid, "", "group.joined",
+            {{"speakers", json::stringify(csv_to_json_array(csv))},
+             {"speaker", joined_speaker}}));
+        json::Value result(json::Value::Type::Object);
+        result["ok"] = json::Value(true);
+        result["speakers"] = json::Value(csv_to_json_array(csv));
         response.body = json::stringify(result);
         return response;
     }
@@ -9768,19 +9916,111 @@ void Daemon::sudo_grant_use_once(const std::string& pw_path,
 
 void Daemon::sudo_grant_revoke()
 {
-    std::string pw_path;
-    std::string askpass_path;
-    {
-        std::lock_guard<std::mutex> lock(sudo_mutex_);
-        if (!sudo_grant_) return;
-        pw_path = sudo_grant_->pw_path;
-        askpass_path = sudo_grant_->askpass_path;
-        sudo_grant_.reset();
+        std::string pw_path;
+        std::string askpass_path;
+        {
+            std::lock_guard<std::mutex> lock(sudo_mutex_);
+            if (!sudo_grant_) return;
+            pw_path = sudo_grant_->pw_path;
+            askpass_path = sudo_grant_->askpass_path;
+            sudo_grant_.reset();
+        }
+        std::error_code ec;
+        std::filesystem::remove(pw_path, ec);
+        std::filesystem::remove(askpass_path, ec);
     }
-    std::error_code ec;
-    std::filesystem::remove(pw_path, ec);
-    std::filesystem::remove(askpass_path, ec);
-}
+
+std::vector<std::string> Daemon::camofox_reap_stale_tabs(
+    const std::string& sid, long long ttl_minutes)
+{
+        std::vector<std::string> stale;
+        const auto cutoff = std::chrono::steady_clock::now() -
+                            std::chrono::minutes(ttl_minutes);
+        {
+            std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+            auto it = camofox_tabs_.find(sid);
+            if (it == camofox_tabs_.end()) return stale;
+            std::vector<StickyCamofoxTab> keep;
+            for (const StickyCamofoxTab& tab : it->second) {
+                if (!tab.busy && tab.last_used < cutoff) {
+                    stale.push_back(tab.tab_id);
+                } else {
+                    keep.push_back(tab);
+                }
+            }
+            if (keep.empty()) camofox_tabs_.erase(it);
+            else it->second = std::move(keep);
+        }
+        return stale;
+    }
+
+std::string Daemon::camofox_take_idle_tab(const std::string& sid)
+{
+        std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+        auto it = camofox_tabs_.find(sid);
+        if (it == camofox_tabs_.end()) return "";
+        for (StickyCamofoxTab& tab : it->second) {
+            if (!tab.busy) {
+                tab.busy = true;
+                tab.last_used = std::chrono::steady_clock::now();
+                return tab.tab_id;
+            }
+        }
+        return "";
+    }
+
+void Daemon::camofox_tab_register(const std::string& sid,
+                                  const std::string& tab_id,
+                                  const std::string& url)
+{
+        std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+        StickyCamofoxTab tab;
+        tab.tab_id = tab_id;
+        tab.url = url;
+        tab.last_used = std::chrono::steady_clock::now();
+        tab.busy = true;
+        camofox_tabs_[sid].push_back(std::move(tab));
+    }
+
+void Daemon::camofox_tab_release(const std::string& sid,
+                                 const std::string& tab_id)
+{
+        std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+        auto it = camofox_tabs_.find(sid);
+        if (it == camofox_tabs_.end()) return;
+        for (StickyCamofoxTab& tab : it->second) {
+            if (tab.tab_id == tab_id) {
+                tab.busy = false;
+                tab.last_used = std::chrono::steady_clock::now();
+            }
+        }
+    }
+
+void Daemon::camofox_tab_drop(const std::string& sid, const std::string& tab_id)
+{
+        std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+        auto it = camofox_tabs_.find(sid);
+        if (it == camofox_tabs_.end()) return;
+        std::vector<StickyCamofoxTab>& tabs = it->second;
+        for (auto entry = tabs.begin(); entry != tabs.end(); ++entry) {
+            if (entry->tab_id == tab_id) {
+                tabs.erase(entry);
+                break;
+            }
+        }
+        if (tabs.empty()) camofox_tabs_.erase(it);
+    }
+
+std::vector<std::string> Daemon::camofox_tabs_forget(const std::string& sid)
+{
+        std::vector<std::string> ids;
+        std::lock_guard<std::mutex> lock(camofox_tabs_mutex_);
+        auto it = camofox_tabs_.find(sid);
+        if (it == camofox_tabs_.end()) return ids;
+        for (const StickyCamofoxTab& tab : it->second) ids.push_back(tab.tab_id);
+        camofox_tabs_.erase(it);
+        return ids;
+    }
 
 // Terminal capture repair (the capture-honesty contract): terminal output
 // arrives CRLF-encoded on Windows and can carry ANSI-codepage bytes that
@@ -11297,6 +11537,8 @@ Daemon::WebConfig Daemon::web_config_snapshot()
         wc.ca_bundle = config_.web_ca_bundle;
         wc.camofox_endpoint = config_.web_camofox_endpoint;
         wc.camofox_token = config_.web_camofox_token;
+        wc.camofox_sticky = config_.web_camofox_sticky;
+        wc.camofox_sticky_ttl_minutes = config_.web_camofox_sticky_ttl_minutes;
         return wc;
     }
 
@@ -12540,7 +12782,7 @@ std::string Daemon::web_fetch_via_firecrawl(const std::string& url, const Daemon
         return out.str();
     }
 
-std::string Daemon::web_fetch_tool(const std::string& url, const std::string& via_text, const WebConfig& wc, const std::string& sid, const std::string& run_id, const CancellationToken& cancellation)
+std::string Daemon::web_fetch_tool(const std::string& url, const std::string& via_text, const WebConfig& wc, const std::string& sid, const std::string& run_id, const std::string& tool_id, const CancellationToken& cancellation)
 {
         const std::string trimmed = trim_ascii(url);
         if (trimmed.empty()) {
@@ -12678,7 +12920,7 @@ std::string Daemon::web_fetch_tool(const std::string& url, const std::string& vi
             if (!wc.camofox_endpoint.empty()) {
                 log::info("web.fetch camofox tier begin url=" + trimmed);
                 const std::string rendered =
-                    web_fetch_via_camofox(trimmed, wc, sid, run_id);
+                    web_fetch_via_camofox(trimmed, wc, sid, run_id, tool_id);
                 if (rendered.rfind("Error:", 0) != 0) return rendered;
                 firecrawl_error = rendered;
             }
@@ -13056,7 +13298,7 @@ std::string Daemon::web_fetch_finish(const std::string& url, int status, const s
 // accessibility snapshot is pulled (text-dense, already page-bounded at the
 // server side), and the tab is closed. Bounded by web.fetch_max_chars like
 // every other tier; the extra REST round-trips ride the fetch timeout.
-std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfig& wc, const std::string& sid, const std::string& run_id)
+std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfig& wc, const std::string& sid, const std::string& run_id, const std::string& tool_id)
 {
         std::string endpoint = trim_ascii(wc.camofox_endpoint);
         while (endpoint.size() > 1 && endpoint.back() == '/') endpoint.pop_back();
@@ -13064,7 +13306,13 @@ std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfi
             return "Error: the fetch escalation failed and no Camofox endpoint "
                    "is configured (web.camofox_endpoint).";
         }
-        const std::string user = "nyaxus-fetch";
+        // Sticky mode (web.camofox_sticky): a per-session browser identity -
+        // cookies and logins persist in that userId's profile across tabs and
+        // daemon runs - and live tabs the fetch navigates. Ephemeral mode
+        // keeps the shared fixed user.
+        const bool sticky = wc.camofox_sticky && !sid.empty();
+        const std::string user = sticky ? "nyaxus-session-" + sid
+                                        : "nyaxus-fetch";
         std::map<std::string, std::string> camofox_headers = {{
             "Content-Type", "application/json"}};
         if (!trim_ascii(wc.camofox_token).empty()) {
@@ -13072,14 +13320,67 @@ std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfi
         }
         const std::map<std::string, std::string> no_headers;
 
-        // 1. Open the tab (the server navigates before responding). A cold
-        //    Camofox browser spin-up + a hard challenge can outrun the
-        //    server's own HANDLER_TIMEOUT (30s - its 500 carries
-        //    retryable:false), so the open retries: the browser stays warm
-        //    past the first attempt and reddit-class walls usually clear by
-        //    the second one.
+        // 1. Open the tab (the server navigates before responding), or, in
+        //    sticky mode, navigate the session's idle tab. A cold Camofox
+        //    browser spin-up + a hard challenge can outrun the server's own
+        //    HANDLER_TIMEOUT (30s - its 500 carries retryable:false), so the
+        //    open retries: the browser stays warm past the first attempt and
+        //    reddit-class walls usually clear by the second one.
         std::string opened;
         std::string tab_id;
+        bool from_open = false;  // only freshly opened tabs register (a
+                                 // reused tab is already in the registry,
+                                 // still busy from its take)
+        if (sticky) {
+            // The idle reaper first: tabs unused for the TTL go, so a burst
+            // of one-off fetches does not accumulate a browser farm.
+            for (const std::string& stale : camofox_reap_stale_tabs(
+                     sid, wc.camofox_sticky_ttl_minutes)) {
+                std::string reap_response;
+                http::request_body("DELETE", endpoint + "/tabs/" + stale +
+                                               "?userId=" + user,
+                                   std::string(), no_headers, reap_response,
+                                   wc.fetch_timeout_ms, nullptr);
+            }
+            // Reuse the session's idle tab (busy tabs are left alone: a
+            // concurrent fetch opens its own, so waves never fight over
+            // navigation). A tab the server no longer knows (restart,
+            // reaper race) falls back to the open path below.
+            const std::string reuse_id = camofox_take_idle_tab(sid);
+            if (!reuse_id.empty()) {
+                json::Value nav_body(json::Value::Type::Object);
+                nav_body["userId"] = json::Value(user);
+                nav_body["url"] = json::Value(url);
+                std::string nav_response;
+                bool navigated = false;
+                if (http::post_body(endpoint + "/tabs/" + reuse_id +
+                                    "/navigate",
+                                    json::stringify(nav_body), camofox_headers,
+                                    nav_response, wc.fetch_timeout_ms)) {
+                    try {
+                        const json::Value nav = json::parse(nav_response);
+                        navigated = nav["navigationOk"].as_bool(false) ||
+                                    nav["ok"].as_bool(false);
+                    } catch (...) {
+                    }
+                }
+                if (navigated) {
+                    tab_id = reuse_id;
+                    opened = nav_response;
+                } else {
+                    // The tab is a ghost (or the navigation was refused):
+                    // drop it server-side and from the registry, then open
+                    // fresh below.
+                    std::string drop_response;
+                    http::request_body("DELETE", endpoint + "/tabs/" +
+                                                   reuse_id + "?userId=" + user,
+                                       std::string(), no_headers,
+                                       drop_response, wc.fetch_timeout_ms,
+                                       nullptr);
+                    camofox_tab_drop(sid, reuse_id);
+                }
+            }
+        }
         for (int attempt = 0; attempt < 3 && tab_id.empty(); ++attempt) {
             std::string attempt_body;
             json::Value open_body(json::Value::Type::Object);
@@ -13100,13 +13401,114 @@ std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfi
                 std::this_thread::sleep_for(std::chrono::milliseconds(2000));
             } else {
                 opened = attempt_body;
+                from_open = true;
             }
+        }
+        if (sticky && from_open && !tab_id.empty()) {
+            camofox_tab_register(sid, tab_id, url);
         }
         if (trim_ascii(tab_id).empty()) {
             return web_fetch_failure_result(
                 url, sid, run_id,
                 "camofox returned no tab id: " + opened.substr(0, 200));
         }
+
+        // The tab is open and the page is loading: announce it. The web's
+        // tool row renders a live "working in a browser" card from this
+        // (title/URL + live page frames). Parsed from the open response now,
+        // so the card carries the title before the snapshot loop starts.
+        std::string title;
+        try {
+            title = json::parse(opened)["title"].as_string();
+        } catch (...) {
+        }
+        // The navigate response carries no title (the open response does):
+        // look the reused tab up in the user's tab listing, best-effort -
+        // the card falls back to url-only when absent.
+        if (title.empty() && sticky) {
+            std::string list_body;
+            if (http::get_body(endpoint + "/tabs?userId=" + user,
+                               camofox_headers, list_body,
+                               wc.fetch_timeout_ms)) {
+                try {
+                    for (const json::Value& entry :
+                         json::parse(list_body)["tabs"].as_array()) {
+                        if (entry["tabId"].as_string() == tab_id) {
+                            title = entry["title"].as_string();
+                            break;
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+        }
+        auto emit_progress = [&](const std::string& frame, bool ledger) {
+            std::map<std::string, std::string> payload = {
+                {"tool_id", tool_id}, {"status", "browsing"},
+                {"title", title}, {"url", url}};
+            if (!frame.empty()) payload["frame"] = frame;
+            if (ledger) {
+                publish(store_->append_event(sid, run_id, "", "tool.progress", payload));
+                return;
+            }
+            // Intermediate frames are SSE-only (not ledgered): a fetch lasts
+            // seconds, so ledgering every 1.5s frame would bloat the session
+            // snapshot. The terminal frame is ledgered so a refresh after
+            // completion still shows the final page.
+            Event ephemeral;
+            static std::atomic<unsigned long long> frame_seq{0};
+            ephemeral.event_id = run_id + ":frame" +
+                                 std::to_string(frame_seq.fetch_add(1));
+            ephemeral.session_id = sid;
+            ephemeral.run_id = run_id;
+            ephemeral.event_type = "tool.progress";
+            ephemeral.emitted_at = now_iso();
+            ephemeral.payload = std::move(payload);
+            publish(ephemeral);
+        };
+        emit_progress("", true);
+
+        // Live page frames: Camofox exposes a per-tab screenshot (base64 PNG).
+        // Captured on the fetch thread during the snapshot loop, throttled to
+        // one frame per kFrameInterval so a slow page does not flood the SSE
+        // stream. A failed capture is best-effort: the card keeps the last
+        // good frame (or just the title/URL) and the fetch proceeds.
+        const auto kFrameInterval = std::chrono::milliseconds(1500);
+        auto last_frame = std::chrono::steady_clock::now() - kFrameInterval;
+        auto capture_frame = [&](bool ledger) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!ledger && now - last_frame < kFrameInterval) return;
+            last_frame = now;
+            std::ostringstream shot_url;
+            shot_url << endpoint << "/tabs/" << tab_id
+                     << "/screenshot?userId=" << user;
+            std::string shot_body;
+            // Same HTTP/1.0 read as the snapshot: a large base64 PNG body
+            // arrives in chunks with compose pauses between them.
+            const long long shot_timeout =
+                wc.fetch_timeout_ms * 2 > 30000 ? wc.fetch_timeout_ms * 2
+                                                : 30000;
+            if (!http::get_body(shot_url.str(), camofox_headers, shot_body,
+                                shot_timeout)) {
+                return;
+            }
+            std::string data_url;
+            try {
+                const json::Value shot = json::parse(shot_body);
+                const json::Value frame = shot["screenshot"];
+                const std::string data = frame["data"].as_string();
+                std::string mime = frame["mimeType"].as_string();
+                if (data.empty()) return;
+                if (trim_ascii(mime).empty()) mime = "image/png";
+                data_url = "data:" + mime + ";base64," + data;
+            } catch (...) {
+                return;
+            }
+            emit_progress(data_url, ledger);
+        };
+        // First frame right after open: the page is usually still loading,
+        // so this is the "preparing" state; later frames show it rendered.
+        capture_frame(false);
 
         // 2. The accessibility snapshot: text-dense page reading with server
         //    pagination (totalChars/nextOffset), looped up to the char cap.
@@ -13116,6 +13518,10 @@ std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfi
                                         ? wc.fetch_max_chars
                                         : 1 << 20;  // 1 MiB anti-runaway
         for (int page = 0; page < 8; ++page) {
+            // The snapshot read is where the wall-clock time goes; capture a
+            // frame before each page so the card tracks the page as it
+            // renders and the a11y tree is pulled page by page.
+            capture_frame(false);
             std::ostringstream snapshot_url;
             snapshot_url << endpoint << "/snapshot?userId=" << user
                          << "&targetId=" << tab_id << "&offset="
@@ -13151,19 +13557,25 @@ std::string Daemon::web_fetch_via_camofox(const std::string& url, const WebConfi
             if (!ok || text.empty()) break;
         }
 
-        // 3. The same REST box owns tab lifecycle; a closed fetch never
-        //    leaks a browser process.
-        std::string delete_response;
-        http::request_body("DELETE", endpoint + "/tabs/" + tab_id +
-                                       "?userId=" + user,
-                           std::string(), no_headers, delete_response,
-                           wc.fetch_timeout_ms, nullptr);
-
-        std::string title;
-        try {
-            title = json::parse(opened)["title"].as_string();
-        } catch (...) {
+        // 3. Terminal frame before the tab closes (or goes idle): the final
+        //    rendered page, ledgered so it survives a refresh (the last frame
+        //    the card shows on the finished row). Ephemeral mode then closes
+        //    the tab - the same REST box owns tab lifecycle, so a closed
+        //    fetch never leaks a browser process. Sticky mode releases the
+        //    tab instead: it stays open (and its idle clock starts) for the
+        //    next fetch to navigate, and the browser profile keeps the
+        //    session's cookies.
+        capture_frame(true);
+        if (sticky) {
+            camofox_tab_release(sid, tab_id);
+        } else {
+            std::string delete_response;
+            http::request_body("DELETE", endpoint + "/tabs/" + tab_id +
+                                           "?userId=" + user,
+                               std::string(), no_headers, delete_response,
+                               wc.fetch_timeout_ms, nullptr);
         }
+
         if (trim_ascii(snapshot_text).empty()) {
             return web_fetch_failure_result(
                 url, sid, run_id,
@@ -13367,7 +13779,7 @@ std::string Daemon::ask_user_question_tool(const std::string& question, const st
         return "The user chose: " + options[order[choice]] + ".";
     }
 
-std::string Daemon::dispatch_tool(const std::string& name, const std::string& arguments, const std::string& sid, const std::string& profile_id, const std::string& run_id, const CancellationToken& cancellation)
+std::string Daemon::dispatch_tool(const std::string& name, const std::string& arguments, const std::string& sid, const std::string& profile_id, const std::string& run_id, const std::string& tool_id, const CancellationToken& cancellation)
 {
         const bool memory_available = memory_available_now();
         const bool web_enabled = web_enabled_now();
@@ -13494,7 +13906,7 @@ std::string Daemon::dispatch_tool(const std::string& name, const std::string& ar
                 paged.fetch_page = page;
             }
             return web_fetch_tool(param("url"), param("via"), paged, sid,
-                                  run_id, cancellation);
+                                  run_id, tool_id, cancellation);
         }
         if (name == "web.use") {
             return web_use_tool(param("ids"), sid);
@@ -15355,7 +15767,7 @@ void Daemon::execute_run(std::shared_ptr<Daemon::Run> run, std::shared_ptr<Daemo
                     const auto started_at = std::chrono::steady_clock::now();
                     std::string result_text = dispatch_tool(
                         tool_names[index], tool_arguments[index], sid,
-                        profile_id, rid, CancellationToken(run->cancel_flag));
+                        profile_id, rid, call_ids[index], CancellationToken(run->cancel_flag));
                     const long long duration_ms =
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - started_at)

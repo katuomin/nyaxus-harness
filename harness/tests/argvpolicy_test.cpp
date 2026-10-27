@@ -219,9 +219,156 @@ int main() {
              {"sed -n 'p' file", "sed -E 's/a/b/' file",
               "find . -maxdepth 2 -type f", "find . -name \"*.txt\""},
              {"sed -i 's/a/b/' file", "sed -i.bak 's/a/b/' file",
-              "sed --in-place file", "find . -delete", "find . -exec ls {}",
+              "sed -ni 's/a/b/' file", "sed --in-place file",
+              "find . -delete", "find . -exec ls {}",
               "find . -ok ls {}", "find . -fprint f", "find . -printf x",
               "find . -execdir ls"});
+
+    // The sed inline script is command data that can escape stream
+    // editing: s's w flag and w/W write files, r/R read files, e runs a
+    // shell. Classification therefore scans every script part (-e values
+    // plus the bare positional script) command by command; anything the
+    // scanner cannot parse exactly gates (fail-closed). -f/--file loads
+    // the script from an unvouched file and gates outright.
+    section("POSIX sed: provably-safe inline script");
+    ro_cases(Shell::Posix,
+             {"sed 's/a/b/g'", "sed -e 's/a/b/' -e 'y/ab/cd/'",
+              "sed -n '10,20p'", "sed 's|x|y|3'", "sed '/re/d'",
+              "sed '$d'", "sed ':a;N;$!ba;s/\\n/ /g'",
+              "sed -n '/x/{s/a/b/p}'", "sed '1~2p'", "sed '1,+1p'",
+              "sed '/h/I!d'", "sed 's/\\[/X/'", "sed 'q'", "sed 'q5'",
+              "sed 'l 40'", "sed '=;='", "sed 'a\\'",
+              "sed --expression=s/a/b/ file", "sed -ne s/a/b/g file"},
+             {"sed 's/a/b/w out.txt'",   // s w flag: file write
+              "sed '/x/w f'",            // w command
+              "sed '/x/W f'",            // W command
+              "sed 'r f'",               // r command
+              "sed '$r f'",
+              "sed 'e echo hi'",         // e command: shell exec
+              "sed 's/a/b/e'",           // s e flag: shell exec
+              "sed -f script.sed",       // unvouched script file
+              "sed --file=script.sed",
+              "sed -fscript.sed",
+              "sed -nf script.sed",      // bundled -f in a bundle
+              "sed -l 40 'l'",           // -l takes a value; gates
+              "sed --debug 'p'",         // unknown long option
+              "sed 's/a/b'",             // unterminated s body
+              "sed '/x[/d'",             // unterminated address regex
+              "sed 'X'",                 // unknown command letter
+              "sed 'T skip'",            // unclassified GNU command
+              "sed 'v'",                 // GNU version command
+              "sed 's/a/b/x'",           // unknown s flag
+              "sed 'a\nw out.txt'"});    // next line after bare a RUNS
+
+    section("POSIX sed: single-quote script data (sh literals)");
+    ro_cases(Shell::Posix,
+             {"sed 's/$d/X/' file", "sed '$!d' file",
+              "echo '!not-history'"},
+             {});
+
+    // Risk-verb taxonomy checklist; fail-closed default posture
+    // (unknown command -> gate) is what keeps most of these safe, so no
+    // entry was added where the shape already gates.
+
+    section("risk-verb taxonomy: state-mutating verbs (both flavors)");
+    for (Shell shell : {Shell::Posix, Shell::Cmd}) {
+        ro_cases(shell,
+                 {},
+                 {"date -s \"next week\"", "date", "date +%s -s 1234",
+                  "ip addr add 10.0.0.1/24 dev eth0",
+                  "ip link set eth0 up",
+                  "mount -t tmpfs tmpfs /mnt/x",
+                  "umount /mnt/x",
+                  "kill -9 1234", "pkill node", "killall chrome",
+                  "dotnet tool install --global mytool",
+                  "dotnet tool restore"});
+    }
+
+    section("risk-verb taxonomy: mutating flags on safe names");
+    ro_cases(Shell::Posix,
+             {"sort a b | uniq -c", "sort keys.txt", "rg pattern file",
+              "rg --type rust todo", "grep -rn pattern src/",
+              "grep -r pattern .", "grep -H pattern f",
+              "grep -o pattern src/", "egrep -i x y", "fgrep x y",
+              "tail -f log.txt", "head -f -n 5 log.txt",
+              "find . -maxdepth 1 -type f",
+              "find . -name \"*.txt\" -print"},
+             {"git commit -m fix",
+              "sort -o out.txt in.txt", "sort --output=out.txt in.txt",
+              "sort -ofu in.txt",   // bundled -o cluster
+              "rg --follow pattern src/", "rg --pre 'x' pattern src/",
+              "grep -R pattern .", "grep -nR pattern .",
+              "grep --dereference-recursive pattern .",
+              "grep --dereference-regex pattern .",
+              "egrep -R x y", "fgrep -R x y",
+              "find -L . -type f", "find -H . -type f",
+              "find . -name x -L"});
+
+    // Command-data vs filesystem-operand separation: for already-allowlisted
+    // read-only commands, an argument the command itself interprets as data
+    // (pattern text, script, sort spec, replacement text) must not be
+    // classified by the write-flag tables, and the end-of-options marker
+    // hands the rest to the operands. Deny flags in real option position,
+    // and the process-spawn data smuggles found by the audit, still gate.
+
+    section("data options: command data is not a write flag");
+    ro_cases(Shell::Posix,
+             {"grep -e -R pattern",          // -e data: searches for "-R"
+              "grep -e -Rx src/",            // bundled in the option value
+              "grep -e -R src/ -e -Rx f",    // plus another data option
+              "grep -ne -R pattern file",    // getopt bundle -n + -e <word>
+              "grep --regexp=-R file",       // attached long value
+              "grep --regexp -R file",       // separate long value
+              "grep -f -R names.txt",        // -f consumes "-R" as file name
+              "grep -- -R src/",             // "-R" after -- is the pattern
+              "rg -e --prefix todo",         // --pre deny must not hit data
+              "rg -r --follow pattern src/", // -r consumes "--follow"
+              "rg -r -R x y",
+              "rg --replace=-R todo",
+              "rg --regexp -R todo",
+              "sort -k -o data.txt",         // key spec "-o", not an option
+              "sort -t- data.txt", "sort -t: -k2,3 data.txt",
+              "sort -nk 2",                  // bundle -n + -k <word>
+              "sort -k2,2 data.txt",         // attached: -k2,2
+              "sort -S -o data.txt",
+              "sort -- -o data.txt",         // operands after --
+              "sed -e -i file",              // script "-i" is data
+              "sed --expression=-i file",
+              "sed -e s/-R/x/ file",
+              "sed -- -i file",
+              "find . -name -L",             // -name consumes "-L" (GNU find
+              "find . -iname -H"},           // takes the next arg verbatim)
+             {"grep -R -e -R src/",          // an option is an option
+              "grep -e -R src/ -R",          // trailing real option still gates
+              "grep --dereference-recursive --regexp -R .",
+              "rg --follow -r -R x",         // --follow before the data option
+              "rg --pre x -r -R y",
+              "sort -o -k2 data.txt",
+              "sort -k2,2 -o out.txt in.txt",
+              "sort --compress-program=x data.txt",
+              "sort --compress-program gzip data.txt",
+              "sed -i -e s/x/y/ file",       // -i in option position
+              "sed --in-place --expression s/x/y/ file",
+              "find -L . -name x",
+              "find . -name x -L"});
+
+    section("process-spawn data smuggles gate");
+    ro_cases(Shell::Posix, {},
+             {"man -P less ls", "man --pager=less ls", "man -H x",
+              "man --html=lynx ls",
+              "fd -x echo x", "fd -X rm .", "fd --exec echo .",
+              "fd --exec-batch=echo .", "fdfind -x echo",
+              "git grep -O pattern",          // pager command runs via shell
+              "git grep -Oless pattern",
+              "git grep --open-files-in-pager pattern"});
+    ro_cases(Shell::Posix,
+             {"man ls", "man -a gcc", "man -w ls",  // reads stay allowed
+              "fd -e txt --hidden .", "fdfind --type file x"},
+             {});
+
+    section("cmd.exe: no end-of-options semantics in the tables");
+    ro_cases(Shell::Cmd, {"icacls dir /T"},
+             {"icacls dir -- /grant u:R"});
 
     if (g_fail == 0) {
         std::cout << "\nARGVPOLICY_TEST_PASSED\n";

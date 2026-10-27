@@ -5,7 +5,7 @@
 // active-path messages with the recorded abstentions in ledger order (an
 // abstention renders at its turn's position, a live in-flight message sorts
 // last).
-import { groupStateFromEvents, groupTranscriptItems, type HarnessEvent, type HarnessMessage } from "../src/harness";
+import { compactEventWindow, groupStateFromEvents, groupTranscriptItems, type HarnessEvent, type HarnessMessage } from "../src/harness";
 
 function fail(message: string): never {
   throw new Error(`group_state_test failed: ${message}`);
@@ -199,6 +199,92 @@ function msg(role: HarnessMessage["role"], runId: string, speaker?: string): Har
   const last = items[items.length - 1];
   if (last.kind !== "message" || last.message.id !== aliceLive.id) {
     fail(`live in-flight message must sort last: ${JSON.stringify(last)}`);
+  }
+}
+
+// ── compactEventWindow keeps the ordering anchors for every run ────────────
+// A long group session outgrows the window; the older runs' run.accepted /
+// run.completed must survive the compaction, or groupTranscriptItems falls
+// back to pos=last/0 for them and the transcript scrambles (the
+// "745-t0-1 -> 685-t0-0 -> 685-t0-1 -> 717-t1-1" report).
+{
+  const runs: string[] = [];
+  const messages: HarnessMessage[] = [];
+  const events: HarnessEvent[] = [];
+  let runCounter = 0;
+  const push = (type: HarnessEvent["type"], runId: string, payload: Record<string, unknown> = {}) => {
+    seq += 1;
+    events.push({ eventId: `evt-${seq}`, sessionId: "session-g", runId, sequence: seq, type, emittedAt: `2026-10-07T00:00:${String(seq).padStart(2, "0")}.000Z`, payload });
+  };
+  for (let r = 0; r < 10; r += 1) {
+    const rid = `run-g${r}`;
+    runs.push(rid);
+    push("run.accepted", rid);
+    messages.push(msg("user", rid));
+    for (let t = 0; t < 2; t += 1) {
+      const turnId = `${rid}-t0-${t}`;
+      push("group.turn.started", turnId, { speaker: t === 0 ? "alice" : "bob", round: "1" });
+      // Filler stream payload so the session outgrows the 500 window.
+      for (let f = 0; f < 30; f += 1) push("metrics.snapshot", turnId, { prompt_tokens: f });
+      messages.push(msg("assistant", turnId, t === 0 ? "alice" : "bob"));
+      push("run.completed", turnId);
+    }
+    push("run.completed", rid);
+  }
+  if (events.length <= 500) fail(`test precondition: need >500 events, got ${events.length}`);
+  const compacted = compactEventWindow(events);
+  // Every run's accepted + completed anchors must survive.
+  const kept = new Map<string, Set<HarnessEvent["type"]>>();
+  for (const event of compacted) {
+    if (!kept.has(event.runId)) kept.set(event.runId, new Set());
+    kept.get(event.runId)!.add(event.type);
+  }
+  for (const rid of runs) {
+    const types = kept.get(rid) ?? new Set();
+    if (!types.has("run.accepted")) fail(`compaction evicted ${rid}'s run.accepted anchor`);
+    if (!types.has("run.completed")) fail(`compaction evicted ${rid}'s run.completed anchor`);
+  }
+  // The transcript order must match the (already-correct) message order.
+  const items = groupTranscriptItems(messages, compacted);
+  const messageOrder = items.filter((item) => item.kind === "message").map((item) => item.message.id);
+  const expectedOrder = messages.map((m) => m.id);
+  if (JSON.stringify(messageOrder) !== JSON.stringify(expectedOrder)) {
+    fail(`compacted transcript order scrambled: ${messageOrder.join(",")} != ${expectedOrder.join(",")}`);
+  }
+}
+
+// -- invite: a 1:1 conversation gains a speaker -------------------------
+// group.joined lands before any group.started; the banner replays the
+// post-join roster from it, and the pre-group history (ordinary runs with
+// their own anchors) keeps its ledger order around the conversion boundary.
+{
+  const user = msg("user", "run-pre");
+  const reply = msg("assistant", "run-pre-re");
+  const events = [
+    make("run.accepted", {}, "run-pre"),
+    make("run.completed", {}, "run-pre-re"),
+    // The invite: the daemon emits the full post-join roster (the 1:1 agent
+    // stays first).
+    make("group.joined", { speakers: ["alice", "bob"], speaker: "bob" }),
+    make("group.started", { speakers: ["alice", "bob"], max_rounds: 3 }),
+  ];
+  const state = groupStateFromEvents(events);
+  if (state.speakers.join(",") !== "alice,bob") {
+    fail(`invite must extend the roster: ${state.speakers.join(",")}`);
+  }
+  // The post-invite group run orders both fresh turns after the pre-group
+  // history, and the roster replacement at group.started stays consistent.
+  const gUser = msg("user", "run-g");
+  const aTurn = msg("assistant", "run-g-t0-0", "alice");
+  const items = groupTranscriptItems([user, reply, gUser, aTurn], [
+    ...events,
+    make("run.accepted", {}, "run-g"),
+    make("group.turn.started", { speaker: "alice", round: "1" }, "run-g-t0-0"),
+    make("run.completed", {}, "run-g-t0-0"),
+  ]);
+  const kinds = items.filter((item) => item.kind === "message").map((item) => item.message.id).join(",");
+  if (kinds !== `${user.id},${reply.id},${gUser.id},${aTurn.id}`) {
+    fail(`converted transcript scrambled: ${kinds}`);
   }
 }
 

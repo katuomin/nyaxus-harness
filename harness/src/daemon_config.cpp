@@ -350,6 +350,14 @@ Config load_config() {
     env_source("NYAXUS_WEB_CAMOFOX_ENDPOINT", "web.camofox_endpoint");
     config.web_camofox_token = env("NYAXUS_WEB_CAMOFOX_TOKEN", "");
     env_source("NYAXUS_WEB_CAMOFOX_TOKEN", "web.camofox_token");
+    config.web_camofox_sticky = env_flag("NYAXUS_WEB_CAMOFOX_STICKY", false);
+    env_source("NYAXUS_WEB_CAMOFOX_STICKY", "web.camofox_sticky");
+    try {
+        const long long ttl = std::stoll(env("NYAXUS_WEB_CAMOFOX_STICKY_TTL_MINUTES", "15"));
+        config.web_camofox_sticky_ttl_minutes = ttl < 1 ? 15 : (ttl > 1440 ? 1440 : ttl);
+    } catch (...) {
+    }
+    env_source("NYAXUS_WEB_CAMOFOX_STICKY_TTL_MINUTES", "web.camofox_sticky_ttl");
     return config;
 }
 
@@ -1006,6 +1014,35 @@ const std::vector<SettingSpec>& settings_registry() {
          [](const Config& c) { return c.web_camofox_token; },
          [](const std::string&, std::string&) { return true; },
          [](Config& c, const std::string& value) { c.web_camofox_token = value; }},
+        {"web.camofox_sticky", "boolean", false, false,
+         [](const Config& c) {
+             return c.web_camofox_sticky ? "true" : "false";
+         },
+         [](const std::string& value, std::string& error) {
+             if (value != "true" && value != "false") {
+                 error = "must be true or false";
+                 return false;
+             }
+             return true;
+         },
+         [](Config& c, const std::string& value) { c.web_camofox_sticky = value == "true"; }},
+        {"web.camofox_sticky_ttl", "integer", false, false,
+         [](const Config& c) { return std::to_string(c.web_camofox_sticky_ttl_minutes); },
+         [](const std::string& value, std::string& error) {
+             try {
+                 const long long ttl = std::stoll(value);
+                 if (ttl < 0 || ttl > 1440) {
+                     error = "must be between 0 and 1440";
+                     return false;
+                 }
+             } catch (...) {
+                 error = "must be an integer";
+                 return false;
+             }
+             return true;
+         },
+         [](Config& c, const std::string& value) {
+             c.web_camofox_sticky_ttl_minutes = std::stoll(value); }},
         {"memory.provider", "string", false, false,
          [](const Config& c) { return c.memory_provider; },
          [](const std::string& value, std::string& error) {

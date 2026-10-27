@@ -16,6 +16,43 @@
 #   F "sequence mixed"  - ls && rm x gates (one write stage).
 #   G "dynamic gates"   - ls $HOME gates ($ expansion is dynamic).
 #
+# Risk-verb taxonomy negatives (audited external checklist) - each shape
+# must gate:
+#   H "date set"        date -s "next week"
+#   I "ip add"          ip addr add 10.0.0.1/24 dev eth0
+#   J "mount gate"      mount -t tmpfs tmpfs /mnt/x
+#   K "kill gate"       kill -9 1234
+#   L "dotnet install"  dotnet tool install --global mytool
+#   P "commit msg"      git commit -m fix
+#   Q "sort out"        sort -o tmp.txt data.txt
+#   M "find follow"     find -L . -type f -name "*.txt"
+#   N "rg follow"       rg --follow pattern src/
+#   O "grep follow"     grep -R pattern .
+# Positive controls: plain non-following reads stay auto-approved:
+#   R "recurse plain"   grep -r pattern .
+#   S "find plain"      find . -type f -name "*.txt"
+#
+# Command-data vs filesystem-operand separation: command data that looks
+# like a write flag stays auto-approved; the process-spawn data smuggles
+# found by the audit must gate:
+#   T "data pattern"    grep -e -R pattern .      (auto: -e data)
+#   Y "sort key"        sort -k2 data.txt         (auto: key-spec data)
+#   U "compress prog"   sort --compress-program=x data.txt (gate: exec)
+#   V "man pager"       man -P less gcc           (gate: pager exec)
+#   W "fd exec"         fd -x echo x              (gate: exec)
+#   X "git pager"       git grep -O pattern       (gate: pager exec)
+#
+# sed inline-script classification: provably pure stream editing stays
+# auto-approved; script data that writes, executes, or loads a script
+# file must gate (the sed write/exec scenarios resolve with deny so the
+# commands never actually run):
+#   Z1 "sed auto"       sed 's/a/b/g'                     (auto)
+#   Z2 "sed script"     sed -e 's/a/b/' -e 'y/ab/cd/'     (auto)
+#   Z3 "sed write"      sed 's/a/b/w out.txt'              (gate)
+#   Z4 "sed exec"       sed 'e echo hi'                    (gate)
+#   Z5 "sed file"       sed -f script.sed                  (gate)
+#   Z6 "sed inplace"    sed -i 's/a/b/' file.txt           (gate)
+#
 # Usage: harness/tests/readonly_argv_test.sh [path-to-nyaxus_daemon]
 set -u
 
@@ -63,10 +100,14 @@ wait_health "$BASE" || fail "daemon did not come up (see $WORKDIR/daemon.log)"
 echo "ok"
 
 # Runs one scenario to completion: creates a session, starts a run with the
-# given message, auto-approves terminal calls (session scope) while polling,
-# and echoes "session-id run-id". Fails the test on run.failed/run.cancelled.
+# given message, resolves terminal calls (session scope) while polling, and
+# echoes "session-id run-id". $2 is the resolution command: "approve" (the
+# daemon then runs the call) or "deny" (the call never runs - used by the
+# risk-verb taxonomy negatives, whose commands would be destructive if
+# executed). Fails the test on run.failed/run.cancelled.
 run_scenario() {
     local message="$1"
+    local action="${2:-approve}"
     local sid run snap aid done=0
     sid="$(curl -sf -X POST "$BASE/sessions" -d '{}' | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
     [ -n "$sid" ] || fail "no session id"
@@ -88,7 +129,7 @@ run_scenario() {
     ' "$run")"
         if [ -n "$aid" ]; then
             curl -sf -X POST "$BASE/runs/$run/commands" -H 'Content-Type: application/json' \
-                -d "{\"command\":\"approve\",\"scope\":\"session\",\"approval_id\":\"$aid\"}" > /dev/null
+                -d "{\"command\":\"$action\",\"scope\":\"session\",\"approval_id\":\"$aid\"}" > /dev/null
         fi
         if printf '%s' "$snap" | grep -q '"event_type":"run.completed"'; then
             done=1
@@ -134,9 +175,9 @@ run_auto() {  # $1 label  $2 scenario message  $3 command regex  $4 answer regex
     curl -sf "$BASE/sessions/$sid" | "$NODE" -e "$NODE_PROG" "$run" "$1" "$3" "$4" || fail "scenario $1 assertions failed"
 }
 
-run_gate() {  # $1 label  $2 scenario message  $3 answer regex
+run_gate() {  # $1 label  $2 scenario message  $3 answer regex  $4 action (approve/deny)
     local sid run
-    read -r sid run < <(run_scenario "$2")
+    read -r sid run < <(run_scenario "$2" "${4:-approve}")
     NODE_PROG="$ASSERT_PROLOGUE"'
     if (reqs.length !== 1) fail("expected exactly one approval.requested, got " + reqs.length);
     if (autos.length !== 0) fail("expected no approval.auto, got " + autos.length);
@@ -167,6 +208,87 @@ run_gate "F" "sequence mixed" "sequence mixed done"
 
 echo "== G: dynamic word gates =="
 run_gate "G" "dynamic gates" "dynamic gates done"
+
+# -- Risk-verb taxonomy negative tests: ------------------------------
+# every shape below must fail the read-only proof and hit the gate.
+
+echo "== H: date -s gates =="
+run_gate "H" "date set" "date set done" deny
+
+echo "== I: ip addr add gates =="
+run_gate "I" "ip add" "ip add done" deny
+
+echo "== J: mount gates =="
+run_gate "J" "mount gate" "mount gate done" deny
+
+echo "== K: kill gates =="
+run_gate "K" "kill gate" "kill gate done" deny
+
+echo "== L: dotnet tool install gates =="
+run_gate "L" "dotnet install" "dotnet install done" deny
+
+echo "== P: git commit -m gates =="
+run_gate "P" "commit msg" "commit msg done" deny
+
+echo "== Q: sort -o gates =="
+run_gate "Q" "sort out" "sort out done" deny
+
+echo "== M: find -L gates (link-following) =="
+run_gate "M" "find follow" "find follow done" deny
+
+echo "== N: rg --follow gates (link-following) =="
+run_gate "N" "rg follow" "rg follow done" deny
+
+echo "== O: grep -R gates (link-following) =="
+run_gate "O" "grep follow" "grep follow done" deny
+
+# -- Positive controls: plain non-following reads stay auto-approved --
+
+echo "== R: grep -r (no follow) still auto-approves =="
+run_auto "R" "recurse plain" "grep -r pattern" "recurse plain done"
+
+echo "== S: find (no -L) still auto-approves =="
+run_auto "S" "find plain" "find \\. -type f" "find plain done"
+
+# -- Command-data vs filesystem-operand separation: -------------------
+
+echo "== T: grep -e -R (pattern data) stays auto-approved =="
+run_auto "T" "data pattern" "grep -e -R pattern" "data pattern done"
+
+echo "== U: sort --compress-program gates (exec smuggle) =="
+run_gate "U" "compress prog" "compress prog done" deny
+
+echo "== V: man -P gates (pager exec) =="
+run_gate "V" "man pager" "man pager done" deny
+
+echo "== W: fd -x gates (exec) =="
+run_gate "W" "fd exec" "fd exec done" deny
+
+echo "== X: git grep -O gates (pager exec) =="
+run_gate "X" "git pager" "git pager done" deny
+
+echo "== Y: sort -k2 (key-spec data) stays auto-approved =="
+run_auto "Y" "sort key" "sort -k2" "sort key done"
+
+# -- sed inline-script classification: --------------------------------
+
+echo "== Z1: sed plain script stays auto-approved =="
+run_auto "Z1" "sed auto" "sed 's/a/b/g'" "sed auto done"
+
+echo "== Z2: sed two expressions stay auto-approved =="
+run_auto "Z2" "sed script" "sed -e 's/a/b/' -e 'y/ab/cd/'" "sed script done"
+
+echo "== Z3: sed s-command w flag gates (file write) =="
+run_gate "Z3" "sed write" "sed write done" deny
+
+echo "== Z4: sed e command gates (shell exec) =="
+run_gate "Z4" "sed exec" "sed exec done" deny
+
+echo "== Z5: sed -f gates (unvouched script file) =="
+run_gate "Z5" "sed file" "sed file done" deny
+
+echo "== Z6: sed -i still gates =="
+run_gate "Z6" "sed inplace" "sed inplace done" deny
 
 echo
 echo "READONLY_ARGV_TEST_PASSED"

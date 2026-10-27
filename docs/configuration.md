@@ -80,6 +80,8 @@ A separate, cheaper model for context compaction (summaries).
 | `NYAXUS_WEB_FIRECRAWL_ENDPOINT` | second escalation tier |
 | `NYAXUS_WEB_SEARCH_ENDPOINT` | search endpoint for `web.search` |
 | `NYAXUS_WEB_CAMOFOX_ENDPOINT` / `_TOKEN` | browser-render tier |
+| `NYAXUS_WEB_CAMOFOX_STICKY` | sticky per-session browser (1 = on) |
+| `NYAXUS_WEB_CAMOFOX_STICKY_TTL_MINUTES` | sticky idle-tab reaper TTL (default 15) |
 
 ## Summaries, context, terminal
 

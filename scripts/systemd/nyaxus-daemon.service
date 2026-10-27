@@ -2,6 +2,14 @@
 Description=Nyaxus agent harness daemon
 After=network-online.target docker.service
 Wants=network-online.target
+# 2026-10-03 lesson: the default start limit (5 starts / 10 s) turns an
+# environmental failure (port held, missing state files) into a restart
+# storm that trips the counter and then gives up. A bounded but patient
+# limit keeps auto-recovery while making a genuinely broken start visible
+# in the journal instead of a give-up. These keys are [Unit]-section on
+# this systemd; in [Service] they are ignored with a warning.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -12,13 +20,6 @@ WorkingDirectory=/agent
 ExecStart=/agent/harness/nyaxus_daemon_linux
 Restart=always
 RestartSec=3
-# 2026-10-03 lesson: the default start limit (5 starts / 10 s) turns an
-# environmental failure (port held, missing state files) into a restart
-# storm that trips the counter and then gives up. A bounded but patient
-# limit keeps auto-recovery while making a genuinely broken start visible
-# in the journal instead of a give-up.
-StartLimitIntervalSec=60
-StartLimitBurst=10
 Environment=NYAXUS_PORT=8787
 # The tracked .env carries this deployment's service secrets; the daemon
 # reads NYAXUS_* configuration from its own config layer first.

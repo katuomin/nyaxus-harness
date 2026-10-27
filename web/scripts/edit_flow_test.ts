@@ -250,6 +250,45 @@ if (getActivePath(swappedMerged).map((m) => m.id).join(",") !== "1,5,-9") {
   if (!turn || turn.parentId !== 1) fail(`streamed turn's parent must follow the persisted user row: ${JSON.stringify(turn)}`);
 }
 
+// ── the renamed optimistic row (A-7) must not drop the persisted row ──
+// App renames the optimistic row onto the daemon's row id once the send ack
+// lands; a snapshot merge that resolves after the rename sees the persisted
+// row carrying the SAME id as optimisticTurn.user. The old id-match
+// "survived" check treated the persisted row as the surviving temp and
+// dropped it - the sent message was invisible for the whole run on a new
+// conversation (transcript showed only the working pill).
+{
+  const renamedUser: HarnessMessage = { id: 7, parentId: 0, role: "user", content: "hi", createdAt: "t", runId: "run-new", isActive: true };
+  const streamedTurn: HarnessMessage = { id: -6, parentId: 7, role: "assistant", content: "streaming…", createdAt: "t", runId: "run-new", isActive: true };
+  const kept = mergeOptimisticSnapshot(
+    [renamedUser, streamedTurn],
+    [{ id: 7, parentId: 0, role: "user", content: "hi", createdAt: "t", runId: "run-new", isActive: true }],
+    new Set(["run-new"]),
+    new Set([]),
+    { user: renamedUser },
+  );
+  if (!kept.some((m) => m.role === "user")) {
+    fail(`renamed temp: user row dropped by the optimistic merge: ${JSON.stringify(kept.map((m) => m.id))}`);
+  }
+  if (getActivePath(kept).map((m) => m.id).join(",") !== "7,-6") {
+    fail(`renamed temp: active path broken: ${getActivePath(kept).map((m) => m.id).join(",")}`);
+  }
+  // The same rename with the snapshot racing ahead of the daemon's row
+  // write: the snapshot carries no user row, so the optimistic row must be
+  // re-added instead of vanishing with the temp-resurrection (positive ids
+  // are not resurrected).
+  const reAdded = mergeOptimisticSnapshot(
+    [renamedUser, streamedTurn],
+    [],
+    new Set(["run-new"]),
+    new Set([]),
+    { user: renamedUser },
+  );
+  if (!reAdded.some((m) => m.id === 7)) {
+    fail(`renamed temp: optimistic row lost when the snapshot raced the row write: ${JSON.stringify(reAdded.map((m) => m.id))}`);
+  }
+}
+
 // ── upsertAssistant cannot parent onto an id that does not exist ──
 // The pending parent id can be stale (a temp swapped out by a merge that
 // ran between the capture and the first delta). The creator must fall back
